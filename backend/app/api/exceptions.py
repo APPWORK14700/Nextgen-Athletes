@@ -111,10 +111,14 @@ class UserNotFoundError(APIException):
 
 class UserAlreadyExistsError(APIException):
     """User already exists exception"""
-    def __init__(self, email: str):
+    def __init__(self, field: str, value: str = None):
+        if value:
+            detail = f"User with {field} '{value}' already exists"
+        else:
+            detail = f"User with {field} already exists"
         super().__init__(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"User with email {email} already exists",
+            detail=detail,
             error_code="USER_ALREADY_EXISTS"
         )
 
@@ -179,4 +183,13 @@ class DatabaseError(APIException):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=detail,
             error_code="DATABASE_ERROR"
-        ) 
+        )
+
+
+# Aliases for backward compatibility
+ValidationError = ValidationException
+AuthenticationError = AuthenticationException
+AuthorizationError = AuthorizationException
+ResourceNotFoundError = NotFoundException
+DatabaseError = InternalServerException
+RateLimitError = RateLimitException 

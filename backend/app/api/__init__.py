@@ -1,6 +1,6 @@
 from .dependencies import get_current_user, get_current_user_optional
 from .exceptions import APIException, ValidationException, AuthenticationException, AuthorizationException
-from .middleware import setup_middleware, RateLimitMiddleware, LoggingMiddleware, ErrorHandlingMiddleware
+from .middleware import SecurityMiddleware
 
 __all__ = [
     "get_current_user",
@@ -9,8 +9,5 @@ __all__ = [
     "ValidationException",
     "AuthenticationException",
     "AuthorizationException",
-    "setup_middleware",
-    "RateLimitMiddleware",
-    "LoggingMiddleware",
-    "ErrorHandlingMiddleware"
+    "SecurityMiddleware"
 ] 

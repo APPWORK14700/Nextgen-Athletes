@@ -6,11 +6,13 @@ This service handles search history management and advanced search functionality
 
 import uuid
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 from app.services.database_service import DatabaseService
 from app.api.exceptions import ResourceNotFoundError, ValidationError, DatabaseError
+from app.utils.athlete_utils import AthleteUtils
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -26,6 +28,135 @@ class SearchService:
         # Configuration
         self.max_searches_per_user = 100
         self.default_suggestion_limit = 5
+        
+        # Search validation patterns
+        self.allowed_search_types = ["athletes", "scouts", "opportunities"]
+        self.max_query_length = 500
+        self.max_filters_count = 20
+        self.max_filter_value_length = 100
+        
+        # Blocked search patterns (prevent malicious queries)
+        self.blocked_patterns = [
+            r'javascript:', r'vbscript:', r'data:', r'file:', r'ftp:',
+            r'<script', r'</script>', r'on\w+\s*=', r'expression\s*\(',
+            r'url\s*\(', r'import\s+', r'@import', r'<iframe', r'</iframe>',
+            r'\.\.', r'\.\.\.', r'\.\.\.\.',  # Directory traversal
+            r'--', r'/\*', r'\*/',  # SQL injection patterns
+            r'<', r'>', r'"', r"'", r'&',  # HTML/XML injection
+        ]
+    
+    def _sanitize_search_query(self, query: str) -> str:
+        """Sanitize search query to prevent injection attacks
+        
+        Args:
+            query: Raw search query
+            
+        Returns:
+            Sanitized search query
+            
+        Raises:
+            ValidationError: If query contains malicious content
+        """
+        if not query or not isinstance(query, str):
+            raise ValidationError("Search query is required and must be a string")
+        
+        # Remove null bytes and control characters
+        sanitized = query.replace('\x00', '').replace('\r', '').replace('\n', ' ')
+        
+        # Check for blocked patterns
+        for pattern in self.blocked_patterns:
+            if re.search(pattern, sanitized, re.IGNORECASE):
+                logger.warning(f"Blocked search pattern detected: {pattern}")
+                raise ValidationError("Search query contains invalid characters")
+        
+        # Limit length
+        if len(sanitized) > self.max_query_length:
+            raise ValidationError(f"Search query too long. Maximum length is {self.max_query_length} characters")
+        
+        # Remove leading/trailing whitespace
+        sanitized = sanitized.strip()
+        
+        if not sanitized:
+            raise ValidationError("Search query cannot be empty after sanitization")
+        
+        return sanitized
+    
+    def _sanitize_filters(self, filters: Dict[str, Any]) -> Dict[str, Any]:
+        """Sanitize search filters to prevent injection attacks
+        
+        Args:
+            filters: Raw search filters
+            
+        Returns:
+            Sanitized search filters
+            
+        Raises:
+            ValidationError: If filters contain malicious content
+        """
+        if not filters:
+            return {}
+        
+        if not isinstance(filters, dict):
+            raise ValidationError("Filters must be a dictionary")
+        
+        if len(filters) > self.max_filters_count:
+            raise ValidationError(f"Too many filters. Maximum allowed is {self.max_filters_count}")
+        
+        sanitized_filters = {}
+        
+        for key, value in filters.items():
+            # Sanitize filter key
+            if not isinstance(key, str):
+                raise ValidationError("Filter keys must be strings")
+            
+            sanitized_key = AthleteUtils.sanitize_string(key, max_length=50)
+            if not sanitized_key:
+                continue
+            
+            # Sanitize filter value
+            if isinstance(value, str):
+                sanitized_value = AthleteUtils.sanitize_string(value, max_length=self.max_filter_value_length)
+                if len(sanitized_value) > self.max_filter_value_length:
+                    raise ValidationError(f"Filter value too long. Maximum length is {self.max_filter_value_length} characters")
+            elif isinstance(value, (int, float, bool)):
+                sanitized_value = value
+            elif isinstance(value, list):
+                # Sanitize list values
+                sanitized_value = []
+                for item in value:
+                    if isinstance(item, str):
+                        sanitized_item = AthleteUtils.sanitize_string(item, max_length=self.max_filter_value_length)
+                        sanitized_value.append(sanitized_item)
+                    else:
+                        sanitized_value.append(item)
+            else:
+                raise ValidationError(f"Unsupported filter value type: {type(value)}")
+            
+            sanitized_filters[sanitized_key] = sanitized_value
+        
+        return sanitized_filters
+    
+    def _validate_search_type(self, search_type: str) -> str:
+        """Validate search type against allowed values
+        
+        Args:
+            search_type: Search type to validate
+            
+        Returns:
+            Validated search type
+            
+        Raises:
+            ValidationError: If search type is invalid
+        """
+        if not search_type or not isinstance(search_type, str):
+            raise ValidationError("Search type is required and must be a string")
+        
+        sanitized_type = search_type.strip().lower()
+        
+        if sanitized_type not in self.allowed_search_types:
+            raise ValidationError(f"Invalid search type. Must be one of: {', '.join(self.allowed_search_types)}")
+        
+        return sanitized_type
     
     async def save_search(
         self,
@@ -35,7 +166,7 @@ class SearchService:
         filters: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Save a search to user's search history
+        Save a search to user's search history with comprehensive validation
         
         Args:
             user_id: ID of the user performing the search
@@ -49,22 +180,30 @@ class SearchService:
         try:
             logger.info(f"Saving search for user: {user_id}, type: {search_type}")
             
-            # Validate search type
-            valid_types = ["athletes", "scouts", "opportunities"]
-            if search_type not in valid_types:
-                raise ValidationError(f"Invalid search type. Must be one of: {', '.join(valid_types)}")
+            # Validate and sanitize user_id
+            if not user_id or not isinstance(user_id, str):
+                raise ValidationError("User ID is required and must be a string")
             
-            # Sanitize query
-            query = query.strip() if query else ""
-            if not query:
-                raise ValidationError("Search query cannot be empty")
+            user_id = user_id.strip()
+            if not user_id:
+                raise ValidationError("User ID cannot be empty")
             
+            # Validate and sanitize search type
+            validated_search_type = self._validate_search_type(search_type)
+            
+            # Sanitize search query
+            sanitized_query = self._sanitize_search_query(query)
+            
+            # Sanitize filters
+            sanitized_filters = self._sanitize_filters(filters)
+            
+            # Create search data with sanitized inputs
             search_data = {
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
-                "search_type": search_type,
-                "query": query,
-                "filters": filters,
+                "search_type": validated_search_type,
+                "query": sanitized_query,
+                "filters": sanitized_filters,
                 "created_at": datetime.now().isoformat()
             }
             
@@ -92,7 +231,7 @@ class SearchService:
         limit: int = 20
     ) -> Dict[str, Any]:
         """
-        Get search history for a user
+        Get search history for a user with validation
         
         Args:
             user_id: ID of the user
@@ -101,396 +240,241 @@ class SearchService:
             limit: Number of results per page
             
         Returns:
-            Paginated search history
+            Search history with pagination
         """
         try:
-            logger.info(f"Getting search history for user: {user_id}, page: {page}")
+            # Validate user_id
+            if not user_id or not isinstance(user_id, str):
+                raise ValidationError("User ID is required and must be a string")
+            
+            user_id = user_id.strip()
+            if not user_id:
+                raise ValidationError("User ID cannot be empty")
+            
+            # Validate pagination parameters
+            if not isinstance(page, int) or page < 1:
+                raise ValidationError("Page must be a positive integer")
+            
+            if not isinstance(limit, int) or limit < 1 or limit > 100:
+                raise ValidationError("Limit must be between 1 and 100")
+            
+            # Validate search_type if provided
+            validated_search_type = None
+            if search_type:
+                validated_search_type = self._validate_search_type(search_type)
             
             # Build query filters
-            from firebase_admin.firestore import FieldFilter
-            filters = [FieldFilter("user_id", "==", user_id)]
+            filters = [("user_id", "==", user_id)]
+            if validated_search_type:
+                filters.append(("search_type", "==", validated_search_type))
             
-            if search_type:
-                # Validate search type
-                valid_types = ["athletes", "scouts", "opportunities"]
-                if search_type not in valid_types:
-                    raise ValidationError(f"Invalid search type. Must be one of: {', '.join(valid_types)}")
-                filters.append(FieldFilter("search_type", "==", search_type))
-            
-            # Calculate offset
+            # Get search history with pagination
             offset = (page - 1) * limit
+            searches = await self.db.query(filters, limit, offset)
             
-            # Get paginated results
-            searches = await self.db.query(filters, limit=limit, offset=offset)
+            # Get total count for pagination
+            total_count = await self.db.count(filters)
             
-            # Get total count
-            total = await self.db.count(filters)
+            # Calculate pagination metadata
+            total_pages = (total_count + limit - 1) // limit
+            has_next = page < total_pages
+            has_previous = page > 1
             
-            result = {
+            return {
                 "searches": searches,
-                "total": total,
-                "page": page,
-                "limit": limit,
-                "has_next": (page * limit) < total,
-                "has_previous": page > 1
+                "pagination": {
+                    "page": page,
+                    "limit": limit,
+                    "total_count": total_count,
+                    "total_pages": total_pages,
+                    "has_next": has_next,
+                    "has_previous": has_previous,
+                    "next_page": page + 1 if has_next else None,
+                    "previous_page": page - 1 if has_previous else None
+                }
             }
             
-            logger.info(f"Retrieved {len(searches)} search history items")
-            return result
-            
         except ValidationError:
-            raise  # Re-raise validation errors as-is
+            raise
         except Exception as e:
             logger.error(f"Error getting search history for user {user_id}: {str(e)}")
             raise DatabaseError(f"Failed to get search history: {str(e)}")
     
-    async def delete_search_history_item(
+    async def get_search_suggestions(
         self,
-        search_id: str,
-        user_id: str
-    ) -> None:
+        user_id: str,
+        search_type: Optional[str] = None,
+        limit: int = None
+    ) -> List[str]:
         """
-        Delete a specific search history item
-        
-        Args:
-            search_id: ID of the search to delete
-            user_id: ID of the user (for authorization)
-        """
-        try:
-            logger.info(f"Deleting search history item: {search_id}")
-            
-            # Verify search exists and belongs to user
-            search = await self.db.get_by_id(search_id)
-            if not search:
-                raise ResourceNotFoundError("Search history item not found", search_id)
-            
-            if search["user_id"] != user_id:
-                raise ValidationError("You can only delete your own search history")
-            
-            await self.db.delete(search_id)
-            
-            logger.info(f"Successfully deleted search history item: {search_id}")
-            
-        except (ResourceNotFoundError, ValidationError):
-            raise  # Re-raise these errors as-is
-        except Exception as e:
-            logger.error(f"Error deleting search history item {search_id}: {str(e)}")
-            raise DatabaseError(f"Failed to delete search history item: {str(e)}")
-    
-    async def clear_user_search_history(self, user_id: str) -> None:
-        """
-        Clear all search history for a user
+        Get search suggestions based on user's search history
         
         Args:
             user_id: ID of the user
+            search_type: Optional filter by search type
+            limit: Maximum number of suggestions
+            
+        Returns:
+            List of search suggestions
         """
         try:
-            logger.info(f"Clearing search history for user: {user_id}")
+            # Validate user_id
+            if not user_id or not isinstance(user_id, str):
+                raise ValidationError("User ID is required and must be a string")
             
-            # Get all user's searches
-            from firebase_admin.firestore import FieldFilter
-            searches = await self.db.query([FieldFilter("user_id", "==", user_id)])
+            user_id = user_id.strip()
+            if not user_id:
+                raise ValidationError("User ID cannot be empty")
             
-            # Delete all searches in batch
-            if searches:
-                search_ids = [search["id"] for search in searches]
-                await self.db.batch_delete(search_ids)
+            # Set default limit
+            if limit is None:
+                limit = self.default_suggestion_limit
             
-            logger.info(f"Successfully cleared {len(searches)} search history items")
+            if not isinstance(limit, int) or limit < 1 or limit > 50:
+                raise ValidationError("Limit must be between 1 and 50")
             
+            # Validate search_type if provided
+            validated_search_type = None
+            if search_type:
+                validated_search_type = self._validate_search_type(search_type)
+            
+            # Build query filters
+            filters = [("user_id", "==", user_id)]
+            if validated_search_type:
+                filters.append(("search_type", "==", validated_search_type))
+            
+            # Get recent searches
+            recent_searches = await self.db.query(filters, limit * 2, 0)
+            
+            # Extract unique queries and count frequency
+            query_counts = {}
+            for search in recent_searches:
+                query = search.get('query', '')
+                if query:
+                    query_counts[query] = query_counts.get(query, 0) + 1
+            
+            # Sort by frequency and recency, return top suggestions
+            sorted_queries = sorted(query_counts.items(), key=lambda x: x[1], reverse=True)
+            suggestions = [query for query, _ in sorted_queries[:limit]]
+            
+            return suggestions
+            
+        except ValidationError:
+            raise
         except Exception as e:
-            logger.error(f"Error clearing search history for user {user_id}: {str(e)}")
-            raise DatabaseError(f"Failed to clear search history: {str(e)}")
+            logger.error(f"Error getting search suggestions for user {user_id}: {str(e)}")
+            raise DatabaseError(f"Failed to get search suggestions: {str(e)}")
+    
+    async def delete_search_history(
+        self,
+        user_id: str,
+        search_ids: Optional[List[str]] = None
+    ) -> bool:
+        """
+        Delete search history for a user
+        
+        Args:
+            user_id: ID of the user
+            search_ids: Optional list of specific search IDs to delete
+            
+        Returns:
+            True if deletion was successful
+        """
+        try:
+            # Validate user_id
+            if not user_id or not isinstance(user_id, str):
+                raise ValidationError("User ID is required and must be a string")
+            
+            user_id = user_id.strip()
+            if not user_id:
+                raise ValidationError("User ID cannot be empty")
+            
+            if search_ids:
+                # Validate search_ids
+                if not isinstance(search_ids, list):
+                    raise ValidationError("Search IDs must be a list")
+                
+                if len(search_ids) > 100:
+                    raise ValidationError("Cannot delete more than 100 searches at once")
+                
+                # Validate each search ID
+                for search_id in search_ids:
+                    if not isinstance(search_id, str) or not search_id.strip():
+                        raise ValidationError("Invalid search ID in list")
+                
+                # Delete specific searches
+                await self.db.batch_delete(search_ids)
+            else:
+                # Delete all search history for user
+                filters = [("user_id", "==", user_id)]
+                user_searches = await self.db.query(filters, 1000, 0)
+                
+                if user_searches:
+                    search_ids_to_delete = [search['id'] for search in user_searches]
+                    await self.db.batch_delete(search_ids_to_delete)
+            
+            logger.info(f"Successfully deleted search history for user {user_id}")
+            return True
+            
+        except ValidationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting search history for user {user_id}: {str(e)}")
+            raise DatabaseError(f"Failed to delete search history: {str(e)}")
+    
+
     
     async def get_popular_searches(
         self,
         search_type: Optional[str] = None,
-        days: int = 30,
         limit: int = 10
     ) -> List[Dict[str, Any]]:
         """
-        Get popular search terms from the last N days
+        Get popular searches across all users
         
         Args:
             search_type: Optional filter by search type
-            days: Number of days to look back
             limit: Maximum number of results
             
         Returns:
-            List of popular search terms with counts
+            List of popular searches with counts
         """
         try:
-            logger.info(f"Getting popular searches, days: {days}, limit: {limit}")
+            # Validate limit
+            if not isinstance(limit, int) or limit < 1 or limit > 100:
+                raise ValidationError("Limit must be between 1 and 100")
             
-            # Calculate date threshold
-            threshold_date = (datetime.now() - timedelta(days=days)).isoformat()
-            
-            # Build filters
-            from firebase_admin.firestore import FieldFilter
-            filters = [FieldFilter("created_at", ">=", threshold_date)]
-            
+            # Validate search_type if provided
+            validated_search_type = None
             if search_type:
-                valid_types = ["athletes", "scouts", "opportunities"]
-                if search_type not in valid_types:
-                    raise ValidationError(f"Invalid search type. Must be one of: {', '.join(valid_types)}")
-                filters.append(FieldFilter("search_type", "==", search_type))
+                validated_search_type = self._validate_search_type(search_type)
             
-            searches = await self.db.query(filters)
+            # Build query filters
+            filters = []
+            if validated_search_type:
+                filters.append(("search_type", "==", validated_search_type))
             
-            # Count search terms
-            term_counts = {}
-            for search in searches:
-                query = search.get("query", "").strip().lower()
-                if query:  # Only count non-empty queries
-                    term_counts[query] = term_counts.get(query, 0) + 1
+            # Get recent searches
+            recent_searches = await self.db.query(filters, limit * 3, 0)
             
-            # Sort by count and return top results
-            popular = [
-                {"term": term, "count": count}
-                for term, count in sorted(term_counts.items(), key=lambda x: x[1], reverse=True)
+            # Count query frequency
+            query_counts = {}
+            for search in recent_searches:
+                query = search.get('query', '')
+                if query:
+                    query_counts[query] = query_counts.get(query, 0) + 1
+            
+            # Sort by frequency and return top results
+            sorted_queries = sorted(query_counts.items(), key=lambda x: x[1], reverse=True)
+            popular_searches = [
+                {"query": query, "count": count} 
+                for query, count in sorted_queries[:limit]
             ]
             
-            result = popular[:limit]
-            logger.info(f"Found {len(result)} popular search terms")
-            return result
+            return popular_searches
             
         except ValidationError:
-            raise  # Re-raise validation errors as-is
+            raise
         except Exception as e:
             logger.error(f"Error getting popular searches: {str(e)}")
-            raise DatabaseError(f"Failed to get popular searches: {str(e)}")
-    
-    async def get_search_suggestions(
-        self,
-        user_id: str,
-        search_type: str,
-        partial_query: str,
-        limit: int = 5
-    ) -> List[str]:
-        """
-        Get search suggestions based on user's search history and popular searches
-        
-        Args:
-            user_id: ID of the user
-            search_type: Type of search
-            partial_query: Partial query to match against
-            limit: Maximum number of suggestions
-            
-        Returns:
-            List of suggested search terms
-        """
-        try:
-            logger.info(f"Getting search suggestions for user: {user_id}, type: {search_type}")
-            
-            # Validate search type
-            valid_types = ["athletes", "scouts", "opportunities"]
-            if search_type not in valid_types:
-                raise ValidationError(f"Invalid search type. Must be one of: {', '.join(valid_types)}")
-            
-            suggestions = set()
-            
-            # Get user's recent searches that match the partial query
-            from firebase_admin.firestore import FieldFilter
-            user_searches = await self.db.query([
-                FieldFilter("user_id", "==", user_id),
-                FieldFilter("search_type", "==", search_type)
-            ], limit=50)
-            
-            for search in user_searches:
-                query = search.get("query", "").strip()
-                if query and partial_query.lower() in query.lower():
-                    suggestions.add(query)
-                    if len(suggestions) >= limit:
-                        break
-            
-            # If we need more suggestions, get from popular searches
-            if len(suggestions) < limit:
-                popular = await self.get_popular_searches(search_type, days=7, limit=20)
-                for item in popular:
-                    term = item["term"]
-                    if partial_query.lower() in term.lower():
-                        suggestions.add(term)
-                        if len(suggestions) >= limit:
-                            break
-            
-            result = list(suggestions)[:limit]
-            logger.info(f"Generated {len(result)} search suggestions")
-            return result
-            
-        except ValidationError:
-            raise  # Re-raise validation errors as-is
-        except Exception as e:
-            logger.error(f"Error getting search suggestions: {str(e)}")
-            raise DatabaseError(f"Failed to get search suggestions: {str(e)}")
-    
-    async def _cleanup_old_searches(self, user_id: str) -> None:
-        """
-        Clean up old searches to keep only the most recent N per user
-        
-        Args:
-            user_id: ID of the user
-        """
-        try:
-            # Get all user's searches ordered by creation date (oldest first)
-            from firebase_admin.firestore import FieldFilter
-            searches = await self.db.query([FieldFilter("user_id", "==", user_id)], limit=1000)
-            
-            # Delete oldest searches if more than max allowed
-            if len(searches) >= self.max_searches_per_user:
-                searches_to_delete = searches[:-self.max_searches_per_user]  # Keep the most recent
-                if searches_to_delete:
-                    search_ids = [search["id"] for search in searches_to_delete]
-                    await self.db.batch_delete(search_ids)
-                    logger.info(f"Cleaned up {len(search_ids)} old search records for user {user_id}")
-                    
-        except Exception as e:
-            logger.error(f"Error cleaning up old searches for user {user_id}: {str(e)}")
-            # Don't raise here as this is a background cleanup operation
-    
-    async def get_search_analytics(self, user_id: str) -> Dict[str, Any]:
-        """
-        Get search analytics for a user
-        
-        Args:
-            user_id: ID of the user
-            
-        Returns:
-            Search analytics data
-        """
-        try:
-            logger.info(f"Getting search analytics for user: {user_id}")
-            
-            # Get all user's searches with pagination to avoid memory issues
-            from firebase_admin.firestore import FieldFilter
-            searches = await self.db.query([FieldFilter("user_id", "==", user_id)], limit=1000)
-            
-            if not searches:
-                return {
-                    "total_searches": 0,
-                    "searches_by_type": {},
-                    "most_common_terms": [],
-                    "search_frequency": {},
-                    "recent_searches": []
-                }
-            
-            # Analyze search patterns
-            searches_by_type = {}
-            term_counts = {}
-            search_frequency = {}
-            recent_searches = []
-            
-            for search in searches:
-                search_type = search.get("search_type", "unknown")
-                searches_by_type[search_type] = searches_by_type.get(search_type, 0) + 1
-                
-                query = search.get("query", "").strip().lower()
-                if query:
-                    term_counts[query] = term_counts.get(query, 0) + 1
-                
-                # Count searches by date
-                date = search.get("created_at", "")[:10]  # Extract date part
-                search_frequency[date] = search_frequency.get(date, 0) + 1
-                
-                # Get recent searches (last 10)
-                if len(recent_searches) < 10:
-                    recent_searches.append({
-                        "query": search.get("query", ""),
-                        "search_type": search_type,
-                        "created_at": search.get("created_at", "")
-                    })
-            
-            # Get most common terms
-            most_common_terms = [
-                {"term": term, "count": count}
-                for term, count in sorted(term_counts.items(), key=lambda x: x[1], reverse=True)
-            ][:10]
-            
-            result = {
-                "total_searches": len(searches),
-                "searches_by_type": searches_by_type,
-                "most_common_terms": most_common_terms,
-                "search_frequency": search_frequency,
-                "recent_searches": recent_searches
-            }
-            
-            logger.info(f"Generated analytics for {len(searches)} searches")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error getting search analytics for user {user_id}: {str(e)}")
-            raise DatabaseError(f"Failed to get search analytics: {str(e)}")
-    
-    async def get_search_trends(
-        self,
-        search_type: Optional[str] = None,
-        days: int = 30
-    ) -> Dict[str, Any]:
-        """
-        Get search trends and insights
-        
-        Args:
-            search_type: Optional filter by search type
-            days: Number of days to analyze
-            
-        Returns:
-            Search trends data
-        """
-        try:
-            logger.info(f"Getting search trends, days: {days}")
-            
-            # Calculate date threshold
-            threshold_date = (datetime.now() - timedelta(days=days)).isoformat()
-            
-            # Build filters
-            from firebase_admin.firestore import FieldFilter
-            filters = [FieldFilter("created_at", ">=", threshold_date)]
-            
-            if search_type:
-                valid_types = ["athletes", "scouts", "opportunities"]
-                if search_type not in valid_types:
-                    raise ValidationError(f"Invalid search type. Must be one of: {', '.join(valid_types)}")
-                filters.append(FieldFilter("search_type", "==", search_type))
-            
-            searches = await self.db.query(filters, limit=1000)
-            
-            # Analyze trends
-            daily_counts = {}
-            search_type_counts = {}
-            top_queries = {}
-            
-            for search in searches:
-                # Daily counts
-                date = search.get("created_at", "")[:10]
-                daily_counts[date] = daily_counts.get(date, 0) + 1
-                
-                # Search type counts
-                search_type = search.get("search_type", "unknown")
-                search_type_counts[search_type] = search_type_counts.get(search_type, 0) + 1
-                
-                # Top queries
-                query = search.get("query", "").strip().lower()
-                if query:
-                    top_queries[query] = top_queries.get(query, 0) + 1
-            
-            # Sort and limit results
-            top_queries_sorted = [
-                {"query": query, "count": count}
-                for query, count in sorted(top_queries.items(), key=lambda x: x[1], reverse=True)
-            ][:20]
-            
-            result = {
-                "total_searches": len(searches),
-                "daily_counts": daily_counts,
-                "search_type_distribution": search_type_counts,
-                "top_queries": top_queries_sorted,
-                "average_daily_searches": len(searches) / days if days > 0 else 0
-            }
-            
-            logger.info(f"Generated trends for {len(searches)} searches")
-            return result
-            
-        except ValidationError:
-            raise  # Re-raise validation errors as-is
-        except Exception as e:
-            logger.error(f"Error getting search trends: {str(e)}")
-            raise DatabaseError(f"Failed to get search trends: {str(e)}") 
+            raise DatabaseError(f"Failed to get popular searches: {str(e)}") 

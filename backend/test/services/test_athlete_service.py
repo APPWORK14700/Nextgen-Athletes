@@ -1,303 +1,442 @@
+"""
+Test file for refactored AthleteService with PerformanceMonitor integration
+"""
 import pytest
-from unittest.mock import AsyncMock, MagicMock
-from datetime import datetime, timedelta
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from datetime import datetime, timezone
 
-from app.services.athlete_service import AthleteService
-from app.api.exceptions import (
-    ValidationError, AuthenticationError, AuthorizationError,
-    ResourceNotFoundError, RateLimitError
-)
+from app.services.athlete_service import AthleteService, AthleteServiceConfig
+from app.models.athlete import AthleteProfileCreate, AthleteProfileUpdate, AthleteSearchFilters
+from app.services.exceptions import AthleteServiceError
+from app.utils.performance_monitor import PerformanceMonitor
 
 
 class TestAthleteService:
-    """Test cases for AthleteService"""
+    """Test cases for refactored AthleteService"""
     
-    @pytest.mark.asyncio
-    async def test_create_athlete_profile(self, mock_athlete_service):
-        """Test creating athlete profile"""
-        profile_data = {
-            "first_name": "John",
-            "last_name": "Doe",
-            "sport": "football",
-            "position": "quarterback",
-            "age": 22,
-            "height": 185,
-            "weight": 85
-        }
-        
-        # Mock successful profile creation
-        mock_athlete_service.database_service.create_document.return_value = {
-            "user_id": "user123",
-            **profile_data,
-            "created_at": datetime.now().isoformat()
-        }
-        
-        result = await mock_athlete_service.create_profile("user123", profile_data)
-        
-        assert result is not None
-        assert result["user_id"] == "user123"
-        assert result["sport"] == "football"
-        mock_athlete_service.database_service.create_document.assert_called_once()
-    
-    @pytest.mark.asyncio
-    async def test_get_athlete_profile(self, mock_athlete_service):
-        """Test getting athlete profile"""
-        # Mock existing athlete
-        mock_athlete_service.database_service.get_document.return_value = {
-            "user_id": "user123",
-            "first_name": "John",
-            "last_name": "Doe",
-            "sport": "football",
-            "position": "quarterback"
-        }
-        
-        result = await mock_athlete_service.get_profile_by_user_id("user123")
-        
-        assert result["first_name"] == "John"
-        assert result["sport"] == "football"
-        assert result["position"] == "quarterback"
-    
-    @pytest.mark.asyncio
-    async def test_search_athletes(self, mock_athlete_service):
-        """Test searching athletes"""
-        # Mock search results
-        mock_athlete_service.database_service.query_documents.return_value = [
-            {"user_id": "user1", "first_name": "John", "sport": "football"},
-            {"user_id": "user2", "first_name": "Jane", "sport": "basketball"}
-        ]
-        mock_athlete_service.database_service.count_documents.return_value = 2
-        
-        filters = {"sport": "football", "position": "quarterback"}
-        result = await mock_athlete_service.search_athletes(filters, page=1, limit=10)
-        
-        assert len(result["athletes"]) == 2
-        assert result["total"] == 2
-        assert result["page"] == 1
-        assert result["limit"] == 10
-    
-    @pytest.mark.asyncio
-    async def test_update_athlete_profile(self, mock_athlete_service):
-        """Test updating athlete profile"""
-        update_data = {"position": "running_back", "weight": 90}
-        
-        # Mock existing profile
-        mock_athlete_service.database_service.get_document.return_value = {
-            "user_id": "user123",
-            "first_name": "John",
-            "position": "quarterback"
-        }
-        
-        # Mock update operation
-        mock_athlete_service.database_service.update_document.return_value = AsyncMock()
-        
-        result = await mock_athlete_service.update_profile("user123", update_data)
-        
-        assert result is not None
-        mock_athlete_service.database_service.update_document.assert_called_once()
-    
-    @pytest.mark.asyncio
-    async def test_get_athlete_stats(self, mock_athlete_service):
-        """Test getting athlete statistics"""
-        # Mock stats data
-        mock_athlete_service.database_service.get_document.return_value = {
-            "user_id": "user123",
-            "stats": {
-                "games_played": 25,
-                "touchdowns": 15,
-                "passing_yards": 3500,
-                "completion_rate": 0.68
+    @pytest.fixture
+    def mock_config(self):
+        """Mock configuration for testing"""
+        return {
+            'collections': {
+                'athlete_profiles': 'athlete_profiles',
+                'users': 'users',
+                'media': 'media'
+            },
+            'search_limits': {
+                'max_limit': 100
+            },
+            'bulk_limits': {
+                'max_bulk_update': 1000
+            },
+            'statistics_limits': {
+                'max_sample_size': 1000
+            },
+            'performance': {
+                'enable_caching': True
+            },
+            'age_limits': {
+                'min_age': 13,
+                'max_age': 100
             }
         }
-        
-        result = await mock_athlete_service.get_stats("user123")
-        
-        assert result["games_played"] == 25
-        assert result["touchdowns"] == 15
-        assert result["passing_yards"] == 3500
     
-    @pytest.mark.asyncio
-    async def test_update_athlete_stats(self, mock_athlete_service):
-        """Test updating athlete statistics"""
-        stats_data = {
-            "games_played": 26,
-            "touchdowns": 16,
-            "passing_yards": 3650
-        }
-        
-        # Mock stats update
-        mock_athlete_service.database_service.update_document.return_value = AsyncMock()
-        mock_athlete_service.database_service.get_document.return_value = {
-            "user_id": "user123",
-            "stats": stats_data
-        }
-        
-        result = await mock_athlete_service.update_stats("user123", stats_data)
-        
-        assert result["stats"]["games_played"] == 26
-        assert result["stats"]["touchdowns"] == 16
-        mock_athlete_service.database_service.update_document.assert_called_once()
+    @pytest.fixture
+    def mock_profile_service(self):
+        """Mock profile service"""
+        mock_service = Mock()
+        mock_service.create_athlete_profile = AsyncMock(return_value={'id': '1', 'name': 'John'})
+        mock_service.get_athlete_profile = AsyncMock(return_value={'id': '1', 'name': 'John'})
+        mock_service.update_athlete_profile = AsyncMock(return_value={'id': '1', 'name': 'John Updated'})
+        mock_service.delete_athlete_profile = AsyncMock(return_value=True)
+        mock_service.restore_athlete_profile = AsyncMock(return_value=True)
+        mock_service.get_athlete_profile_completion = AsyncMock(return_value={'completion': 85})
+        return mock_service
     
-    @pytest.mark.asyncio
-    async def test_get_athlete_media(self, mock_athlete_service):
-        """Test getting athlete media"""
-        # Mock media data
-        mock_athlete_service.database_service.query_documents.return_value = [
-            {"id": "media1", "title": "Game Highlights", "type": "video"},
-            {"id": "media2", "title": "Training Session", "type": "video"}
-        ]
-        
-        result = await mock_athlete_service.get_media("user123", page=1, limit=10)
-        
-        assert len(result) == 2
-        assert result[0]["title"] == "Game Highlights"
-        assert result[1]["title"] == "Training Session"
+    @pytest.fixture
+    def mock_search_service(self):
+        """Mock search service"""
+        mock_service = Mock()
+        mock_service.search_athletes = AsyncMock(return_value=Mock(count=1, results=[{'id': '1'}]))
+        mock_service.get_athletes_by_sport_category = AsyncMock(return_value=Mock(count=1, results=[{'id': '1'}]))
+        mock_service.get_athletes_by_location = AsyncMock(return_value=Mock(count=1, results=[{'id': '1'}]))
+        mock_service.get_athletes_by_age_range = AsyncMock(return_value=Mock(count=1, results=[{'id': '1'}]))
+        mock_service.get_active_athletes_count = AsyncMock(return_value=100)
+        return mock_service
     
-    @pytest.mark.asyncio
-    async def test_get_athlete_analytics(self, mock_athlete_service):
-        """Test getting athlete analytics"""
-        # Mock analytics data
-        mock_athlete_service.database_service.query_documents.return_value = [
-            {"metric": "profile_views", "value": 150, "date": "2024-01-15"},
-            {"metric": "media_views", "value": 85, "date": "2024-01-15"}
-        ]
-        
-        result = await mock_athlete_service.get_analytics("user123")
-        
-        assert len(result) == 2
-        assert result[0]["metric"] == "profile_views"
-        assert result[0]["value"] == 150
+    @pytest.fixture
+    def mock_recommendation_service(self):
+        """Mock recommendation service"""
+        mock_service = Mock()
+        mock_service.get_recommended_athletes = AsyncMock(return_value=[{'id': '1', 'name': 'John'}])
+        mock_service.get_athletes_by_preferences = AsyncMock(return_value=[{'id': '1', 'name': 'John'}])
+        mock_service.get_similar_athletes = AsyncMock(return_value=[{'id': '2', 'name': 'Jane'}])
+        return mock_service
     
-    @pytest.mark.asyncio
-    async def test_get_athlete_recommendations(self, mock_athlete_service):
-        """Test getting athlete recommendations"""
-        # Mock recommendations
-        mock_athlete_service.database_service.query_documents.return_value = [
-            {"id": "opp1", "title": "NFL Tryout", "type": "trial", "match_score": 0.95},
-            {"id": "opp2", "title": "College Scholarship", "type": "scholarship", "match_score": 0.87}
-        ]
-        
-        result = await mock_athlete_service.get_recommendations("user123", sport="football")
-        
-        assert len(result) == 2
-        assert result[0]["title"] == "NFL Tryout"
-        assert result[0]["match_score"] == 0.95
+    @pytest.fixture
+    def mock_analytics_service(self):
+        """Mock analytics service"""
+        mock_service = Mock()
+        mock_service.get_athlete_analytics = AsyncMock(return_value=Mock(profile_views=10))
+        mock_service.get_athlete_statistics = AsyncMock(return_value={'total_athletes': 100})
+        mock_service.bulk_update_athletes = AsyncMock(return_value={'updated': 5})
+        mock_service.get_athlete_media = AsyncMock(return_value=[{'id': '1', 'type': 'image'}])
+        mock_service.get_athlete_stats = AsyncMock(return_value=[{'id': '1', 'stat': '100m'}])
+        mock_service.get_active_athletes_count = AsyncMock(return_value=100)
+        return mock_service
     
-    @pytest.mark.asyncio
-    async def test_add_achievement(self, mock_athlete_service):
-        """Test adding athlete achievement"""
-        achievement_data = {
-            "type": "championship",
-            "title": "State Championship Winner",
-            "description": "Won state championship with team",
-            "date_achieved": "2024-01-01"
-        }
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    def test_init_with_performance_monitor(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test service initialization with PerformanceMonitor"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
         
-        # Mock achievement creation
-        mock_athlete_service.database_service.create_document.return_value = {
-            "id": "achievement123",
-            "athlete_id": "user123",
-            **achievement_data
-        }
+        service = AthleteService()
         
-        result = await mock_athlete_service.add_achievement("user123", achievement_data)
-        
-        assert result["title"] == "State Championship Winner"
-        assert result["type"] == "championship"
-        mock_athlete_service.database_service.create_document.assert_called_once()
+        assert service.config == mock_config
+        assert isinstance(service.performance_monitor, PerformanceMonitor)
+        assert service.profile_service is not None
+        assert service.search_service is not None
+        assert service.recommendation_service is not None
+        assert service.analytics_service is not None
     
-    @pytest.mark.asyncio
-    async def test_get_athlete_achievements(self, mock_athlete_service):
-        """Test getting athlete achievements"""
-        # Mock achievements
-        mock_athlete_service.database_service.query_documents.return_value = [
-            {"id": "ach1", "title": "MVP Award", "type": "individual"},
-            {"id": "ach2", "title": "Team Captain", "type": "leadership"}
-        ]
+    @patch('app.services.athlete_service.get_athlete_config')
+    def test_init_with_missing_config(self, mock_get_config):
+        """Test service initialization with missing configuration"""
+        mock_get_config.return_value = {'collections': {}}
         
-        result = await mock_athlete_service.get_achievements("user123")
-        
-        assert len(result) == 2
-        assert result[0]["title"] == "MVP Award"
-        assert result[1]["title"] == "Team Captain"
+        with pytest.raises(ValueError, match="Missing required configuration keys"):
+            AthleteService()
     
-    @pytest.mark.asyncio
-    async def test_verify_athlete_profile(self, mock_athlete_service):
-        """Test verifying athlete profile"""
-        verification_data = {
-            "document_type": "student_id",
-            "document_url": "https://example.com/student_id.jpg",
-            "additional_info": "Current university student"
-        }
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    def test_performance_monitor_threshold_configuration(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test PerformanceMonitor is configured with correct thresholds"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
         
-        # Mock verification submission
-        mock_athlete_service.database_service.create_document.return_value = {
-            "id": "verification123",
-            "user_id": "user123",
-            "status": "pending",
-            **verification_data
-        }
+        service = AthleteService()
         
-        result = await mock_athlete_service.submit_verification("user123", verification_data)
-        
-        assert result["status"] == "pending"
-        assert result["document_type"] == "student_id"
-        mock_athlete_service.database_service.create_document.assert_called_once()
+        # Check that PerformanceMonitor is initialized with the maximum threshold
+        max_threshold = max(AthleteServiceConfig.SLOW_OPERATION_THRESHOLDS.values())
+        assert service.performance_monitor.threshold_ms == max_threshold
     
-    @pytest.mark.asyncio
-    async def test_search_athletes_by_sport_and_location(self, mock_athlete_service):
-        """Test searching athletes with specific filters"""
-        # Mock search with complex filters
-        mock_athlete_service.database_service.query_documents.return_value = [
-            {
-                "user_id": "user1", 
-                "sport": "football", 
-                "location": "California",
-                "position": "quarterback"
-            }
-        ]
-        mock_athlete_service.database_service.count_documents.return_value = 1
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    def test_get_performance_metrics(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test performance metrics retrieval"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
         
-        filters = {
-            "sport": "football",
-            "location": "California",
-            "position": "quarterback",
-            "min_age": 18,
-            "max_age": 25
-        }
+        service = AthleteService()
         
-        result = await mock_athlete_service.search_athletes(filters, page=1, limit=10)
+        # Mock the performance monitor methods
+        service.performance_monitor.get_metrics = Mock(return_value={'test': 'metrics'})
+        service.performance_monitor.get_slow_operations = Mock(return_value={'slow': 'ops'})
+        service.performance_monitor.generate_report = Mock(return_value='Performance Report')
         
-        assert len(result["athletes"]) == 1
-        assert result["athletes"][0]["sport"] == "football"
-        assert result["athletes"][0]["location"] == "California"
+        metrics = service.get_performance_metrics()
+        
+        assert 'performance_monitor_metrics' in metrics
+        assert 'slow_operations' in metrics
+        assert 'performance_report' in metrics
+        assert metrics['performance_monitor_metrics'] == {'test': 'metrics'}
+        assert metrics['slow_operations'] == {'slow': 'ops'}
+        assert metrics['performance_report'] == 'Performance Report'
     
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
     @pytest.mark.asyncio
-    async def test_get_athlete_profile_completion(self, mock_athlete_service):
-        """Test calculating athlete profile completion percentage"""
-        # Mock profile with some fields filled
-        mock_athlete_service.database_service.get_document.return_value = {
-            "user_id": "user123",
-            "first_name": "John",
-            "last_name": "Doe",
-            "sport": "football",
-            "position": "quarterback",
-            "bio": None,  # Missing field
-            "profile_image_url": None  # Missing field
-        }
+    async def test_profile_operations_with_performance_monitoring(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test profile operations with PerformanceMonitor integration"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = mock_profile_service()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
         
-        result = await mock_athlete_service.calculate_profile_completion("user123")
+        service = AthleteService()
         
-        assert result["completion_percentage"] < 100
-        assert "missing_fields" in result
-        assert len(result["missing_fields"]) > 0
+        # Test profile creation
+        profile_data = AthleteProfileCreate(
+            first_name="John",
+            last_name="Doe",
+            date_of_birth=datetime(2000, 1, 1).date(),
+            gender="male",
+            location="NYC",
+            primary_sport_category_id="football",
+            position="forward",
+            height_cm=180,
+            weight_kg=75
+        )
+        
+        result = await service.create_athlete_profile("user123", profile_data)
+        assert result['id'] == '1'
+        assert result['name'] == 'John'
+        
+        # Verify PerformanceMonitor has metrics for this operation
+        metrics = service.performance_monitor.get_metrics()
+        assert 'profile_creation' in metrics
     
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
     @pytest.mark.asyncio
-    async def test_delete_athlete_profile(self, mock_athlete_service):
-        """Test deleting athlete profile"""
-        # Mock profile deletion
-        mock_athlete_service.database_service.delete_document.return_value = AsyncMock()
+    async def test_search_operations_with_performance_monitoring(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test search operations with PerformanceMonitor integration"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = mock_search_service()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
         
-        result = await mock_athlete_service.delete_profile("user123")
+        service = AthleteService()
         
-        assert result["message"] == "Athlete profile deleted successfully"
-        mock_athlete_service.database_service.delete_document.assert_called_once() 
+        # Test search athletes
+        filters = AthleteSearchFilters(limit=20, offset=0)
+        result = await service.search_athletes(filters)
+        assert result.count == 1
+        
+        # Test get athletes by sport category
+        result = await service.get_athletes_by_sport_category("football", limit=10)
+        assert result.count == 1
+        
+        # Verify PerformanceMonitor has metrics for these operations
+        metrics = service.performance_monitor.get_metrics()
+        assert 'search_operation' in metrics
+        assert 'sport_category_query' in metrics
+    
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    @pytest.mark.asyncio
+    async def test_recommendation_operations_with_performance_monitoring(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test recommendation operations with PerformanceMonitor integration"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = mock_recommendation_service()
+        mock_analytics.return_value = Mock()
+        
+        service = AthleteService()
+        
+        # Test get recommended athletes
+        result = await service.get_recommended_athletes("scout123", limit=10)
+        assert len(result) == 1
+        assert result[0]['name'] == 'John'
+        
+        # Test get athletes by preferences
+        preferences = {'sport': 'football', 'position': 'forward'}
+        result = await service.get_athletes_by_preferences(preferences, limit=10)
+        assert len(result) == 1
+        
+        # Verify PerformanceMonitor has metrics for these operations
+        metrics = service.performance_monitor.get_metrics()
+        assert 'recommendation_query' in metrics
+        assert 'preference_query' in metrics
+    
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    @pytest.mark.asyncio
+    async def test_analytics_operations_with_performance_monitoring(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test analytics operations with PerformanceMonitor integration"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = mock_analytics_service()
+        
+        service = AthleteService()
+        
+        # Test get athlete analytics
+        result = await service.get_athlete_analytics("athlete123")
+        assert result.profile_views == 10
+        
+        # Test get athlete statistics
+        result = await service.get_athlete_statistics()
+        assert result['total_athletes'] == 100
+        
+        # Test bulk update
+        updates = [{'id': '1', 'update': 'data'}]
+        result = await service.bulk_update_athletes(updates)
+        assert result['updated'] == 5
+        
+        # Verify PerformanceMonitor has metrics for these operations
+        metrics = service.performance_monitor.get_metrics()
+        assert 'analytics_query' in metrics
+        assert 'statistics_query' in metrics
+        assert 'bulk_operation' in metrics
+    
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    def test_service_config(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test service configuration retrieval"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
+        
+        service = AthleteService()
+        
+        config = service.get_service_config()
+        
+        assert config['environment'] == 'production'  # Since enable_caching is True
+        assert 'profile_service' in config['services']
+        assert 'search_service' in config['services']
+        assert 'recommendation_service' in config['services']
+        assert 'analytics_service' in config['services']
+        assert 'performance' in config
+        assert 'limits' in config
+        assert 'thresholds' in config
+        assert 'default_limits' in config
+        assert config['thresholds'] == AthleteServiceConfig.SLOW_OPERATION_THRESHOLDS
+        assert config['default_limits'] == AthleteServiceConfig.DEFAULT_LIMITS
+    
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    @pytest.mark.asyncio
+    async def test_health_check(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test health check functionality"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = mock_profile_service()
+        mock_search.return_value = mock_search_service()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = mock_analytics_service()
+        
+        service = AthleteService()
+        
+        health = await service.health_check()
+        
+        assert 'status' in health
+        assert 'timestamp' in health
+        assert 'services' in health
+        assert 'profile_service' in health['services']
+        assert 'search_service' in health['services']
+        assert 'recommendation_service' in health['services']
+        assert 'analytics_service' in health['services']
+    
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    def test_validation_decorators(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test validation decorators still work correctly"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
+        
+        service = AthleteService()
+        
+        # Test user_id validation
+        with pytest.raises(ValueError, match="user_id cannot be empty"):
+            service.create_athlete_profile("", AthleteProfileCreate(
+                first_name="John",
+                last_name="Doe",
+                date_of_birth=datetime(2000, 1, 1).date(),
+                gender="male",
+                location="NYC",
+                primary_sport_category_id="football",
+                position="forward",
+                height_cm=180,
+                weight_kg=75
+            ))
+        
+        # Test athlete_id validation
+        with pytest.raises(ValueError, match="athlete_id cannot be empty"):
+            service.get_athlete_by_id("")
+        
+        # Test pagination validation
+        with pytest.raises(ValueError, match="limit must be between 1 and 100"):
+            service.get_athletes_by_sport_category("football", limit=0)
+        
+        with pytest.raises(ValueError, match="offset cannot be negative"):
+            service.get_athletes_by_sport_category("football", offset=-1)
+        
+        # Test age range validation
+        with pytest.raises(ValueError, match="min_age cannot be greater than max_age"):
+            service.get_athletes_by_age_range(25, 20)
+        
+        # Test bulk operations validation
+        with pytest.raises(ValueError, match="updates list cannot be empty"):
+            service.bulk_update_athletes([])
+        
+        # Test preferences validation
+        with pytest.raises(ValueError, match="preferences cannot be empty"):
+            service.get_athletes_by_preferences({})
+        
+        # Test filters validation
+        with pytest.raises(ValueError, match="filters cannot be None"):
+            service.search_athletes(None)
+    
+    @patch('app.services.athlete_service.get_athlete_config')
+    @patch('app.services.athlete_service.AthleteProfileService')
+    @patch('app.services.athlete_service.AthleteSearchService')
+    @patch('app.services.athlete_service.AthleteRecommendationService')
+    @patch('app.services.athlete_service.AthleteAnalyticsService')
+    def test_performance_monitor_integration(self, mock_analytics, mock_recommendation, mock_search, mock_profile, mock_get_config, mock_config):
+        """Test that PerformanceMonitor is properly integrated and accessible"""
+        mock_get_config.return_value = mock_config
+        mock_profile.return_value = Mock()
+        mock_search.return_value = Mock()
+        mock_recommendation.return_value = Mock()
+        mock_analytics.return_value = Mock()
+        
+        service = AthleteService()
+        
+        # Verify PerformanceMonitor instance exists and has expected methods
+        assert hasattr(service.performance_monitor, 'get_metrics')
+        assert hasattr(service.performance_monitor, 'get_slow_operations')
+        assert hasattr(service.performance_monitor, 'generate_report')
+        assert hasattr(service.performance_monitor, 'reset_metrics')
+        
+        # Test that metrics start empty
+        initial_metrics = service.performance_monitor.get_metrics()
+        assert initial_metrics == {}
+        
+        # Test that we can reset metrics
+        service.performance_monitor.reset_metrics()
+        reset_metrics = service.performance_monitor.get_metrics()
+        assert reset_metrics == {}
+
+
+if __name__ == "__main__":
+    pytest.main([__file__]) 

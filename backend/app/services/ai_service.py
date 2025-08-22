@@ -1,244 +1,269 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TypedDict
 import logging
-import asyncio
-import random
-from datetime import datetime
+from datetime import datetime, timezone
+
+from ..config.ai_config import get_ai_config, AIConfig
+from ..ai.providers import create_ai_provider
+from ..ai.services import MediaAnalysisService, ContentModerationService, MetadataExtractionService
 
 logger = logging.getLogger(__name__)
+
+
+class MediaAnalysisResult(TypedDict):
+    """Type definition for media analysis results"""
+    confidence_score: float
+    sport_detected: Optional[str]
+    technical_rating: Optional[float]
+    analysis_summary: str
+    media_url: str
+    media_type: str
+    timestamp: str
+
+
+class ContentValidationResult(TypedDict):
+    """Type definition for content validation results"""
+    is_appropriate: bool
+    confidence_score: float
+    moderation_notes: Optional[str]
+    media_url: str
+    media_type: str
+    timestamp: str
+
+
+class MetadataExtractionResult(TypedDict):
+    """Type definition for metadata extraction results"""
+    metadata: Dict[str, Any]
+    confidence_score: float
+    media_url: str
+    media_type: str
+    timestamp: str
+
+
+class ServiceStatusResult(TypedDict):
+    """Type definition for service status results"""
+    status: str
+    ai_provider: Dict[str, Any]
+    services: Dict[str, Any]
+    config: Dict[str, Any]
+    timestamp: str
+    error: Optional[str]
 
 
 class AIService:
     """AI service for analyzing athlete media and providing ratings"""
     
-    def __init__(self):
-        # In production, you would initialize your AI models here
-        # For now, we'll simulate AI analysis
-        self.rating_levels = ["exceptional", "excellent", "good", "developing", "needs_improvement"]
+    def __init__(self, config: Optional[AIConfig] = None):
+        self.config = config or get_ai_config()
+        # Create a proper config dict instead of accessing __dict__
+        config_dict = {
+            'model_provider': self.config.model_provider.value,
+            'model_name': self.config.model_name,
+            'api_key': self.config.api_key,
+            'api_base_url': self.config.api_base_url,
+            'confidence_threshold': self.config.confidence_threshold,
+            'max_processing_time': self.config.max_processing_time,
+            'enable_concurrent_analysis': self.config.enable_concurrent_analysis,
+            'max_concurrent_analyses': self.config.max_concurrent_analyses,
+            'enable_content_moderation': self.config.enable_content_moderation,
+            'moderation_threshold': self.config.moderation_threshold,
+            'enable_metadata_extraction': self.config.enable_metadata_extraction,
+            'extract_technical_details': self.config.extract_technical_details,
+            'auto_detect_sport': self.config.auto_detect_sport,
+            'supported_sports': self.config.supported_sports,
+            'cache_results': self.config.cache_results,
+            'cache_ttl_hours': self.config.cache_ttl_hours,
+            'enable_mock_mode': self.config.enable_mock_mode,
+        }
+        self.ai_provider = create_ai_provider(config_dict)
+        
+        # Initialize specialized services
+        self.analysis_service = MediaAnalysisService(self.ai_provider, self.config)
+        self.moderation_service = ContentModerationService(self.ai_provider, self.config)
+        self.extraction_service = MetadataExtractionService(self.ai_provider, self.config)
     
-    async def analyze_media(self, media_url: str, media_type: str) -> Dict[str, Any]:
+    def _validate_media_input(self, media_url: str, media_type: str) -> None:
+        """Validate media input parameters"""
+        if not media_url or not isinstance(media_url, str):
+            raise ValueError("media_url must be a non-empty string")
+        if not media_type or not isinstance(media_type, str):
+            raise ValueError("media_type must be a non-empty string")
+        if not media_url.startswith(('http://', 'https://', 'file://')):
+            raise ValueError("media_url must be a valid URL or file path")
+
+    def _validate_media_list(self, media_list: List[Dict[str, Any]]) -> None:
+        """Validate media list input"""
+        if not isinstance(media_list, list):
+            raise ValueError("media_list must be a list")
+        if not media_list:
+            raise ValueError("media_list cannot be empty")
+        for media in media_list:
+            if not isinstance(media, dict):
+                raise ValueError("Each media item must be a dictionary")
+            if 'url' not in media or 'type' not in media:
+                raise ValueError("Each media item must contain 'url' and 'type' keys")
+
+    async def analyze_media(self, media_url: str, media_type: str) -> MediaAnalysisResult:
         """Analyze media and provide AI rating and analysis"""
+        self._validate_media_input(media_url, media_type)
         try:
-            # Simulate AI processing time
-            await asyncio.sleep(random.uniform(2, 5))
-            
-            # Simulate AI analysis results
-            # In production, this would call your actual AI model
-            analysis_result = await self._simulate_ai_analysis(media_url, media_type)
-            
-            return analysis_result
-            
+            return await self.analysis_service.analyze_media(media_url, media_type)
         except Exception as e:
             logger.error(f"Error analyzing media {media_url}: {e}")
             raise
     
-    async def _simulate_ai_analysis(self, media_url: str, media_type: str) -> Dict[str, Any]:
-        """Simulate AI analysis results"""
-        try:
-            # Generate random but realistic analysis results
-            rating = random.choice(self.rating_levels)
-            confidence_score = random.uniform(0.7, 0.95)
-            
-            # Generate detailed analysis scores
-            detailed_analysis = {
-                "technical_skills": round(random.uniform(6.0, 9.5), 1),
-                "physical_attributes": round(random.uniform(6.0, 9.5), 1),
-                "game_intelligence": round(random.uniform(6.0, 9.5), 1),
-                "consistency": round(random.uniform(6.0, 9.5), 1),
-                "potential": round(random.uniform(6.0, 9.5), 1)
-            }
-            
-            # Generate sport-specific metrics based on media type
-            sport_specific_metrics = await self._generate_sport_specific_metrics(media_type)
-            
-            # Generate summary
-            summary = await self._generate_summary(rating, detailed_analysis, sport_specific_metrics)
-            
-            return {
-                "rating": rating,
-                "summary": summary,
-                "detailed_analysis": detailed_analysis,
-                "sport_specific_metrics": sport_specific_metrics,
-                "confidence_score": round(confidence_score, 3)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error simulating AI analysis: {e}")
-            raise
-    
-    async def _generate_sport_specific_metrics(self, media_type: str) -> Dict[str, Any]:
-        """Generate sport-specific metrics based on media type"""
-        try:
-            if media_type == "video":
-                # Soccer/Football metrics
-                return {
-                    "dribbling_accuracy": round(random.uniform(70, 95), 1),
-                    "passing_accuracy": round(random.uniform(75, 90), 1),
-                    "shooting_accuracy": round(random.uniform(60, 85), 1),
-                    "tackling_success_rate": round(random.uniform(65, 90), 1),
-                    "speed": round(random.uniform(7.0, 9.5), 1),
-                    "stamina": round(random.uniform(7.0, 9.0), 1)
-                }
-            elif media_type == "reel":
-                # Basketball metrics
-                return {
-                    "shooting_percentage": round(random.uniform(35, 65), 1),
-                    "rebounding_rate": round(random.uniform(5, 15), 1),
-                    "assist_rate": round(random.uniform(2, 8), 1),
-                    "steal_rate": round(random.uniform(1, 4), 1),
-                    "block_rate": round(random.uniform(0.5, 3), 1),
-                    "vertical_jump": round(random.uniform(20, 40), 1)
-                }
-            else:
-                # Generic metrics for images
-                return {
-                    "athletic_presence": round(random.uniform(7.0, 9.5), 1),
-                    "physical_condition": round(random.uniform(7.0, 9.5), 1),
-                    "technique_display": round(random.uniform(6.5, 9.0), 1)
-                }
-                
-        except Exception as e:
-            logger.error(f"Error generating sport-specific metrics: {e}")
-            raise
-    
-    async def _generate_summary(self, rating: str, detailed_analysis: Dict[str, float], sport_metrics: Dict[str, Any]) -> str:
-        """Generate AI summary based on analysis results"""
-        try:
-            # Calculate average score
-            avg_score = sum(detailed_analysis.values()) / len(detailed_analysis)
-            
-            if rating == "exceptional":
-                return f"Exceptional performance with outstanding technical skills ({detailed_analysis['technical_skills']}/10) and game intelligence ({detailed_analysis['game_intelligence']}/10). Shows elite-level potential with excellent consistency."
-            elif rating == "excellent":
-                return f"Excellent performance demonstrating strong technical abilities ({detailed_analysis['technical_skills']}/10) and good game understanding. Shows high potential for development."
-            elif rating == "good":
-                return f"Good performance with solid fundamentals. Technical skills ({detailed_analysis['technical_skills']}/10) are developing well with room for improvement in consistency."
-            elif rating == "developing":
-                return f"Developing player with basic skills in place. Technical abilities ({detailed_analysis['technical_skills']}/10) need refinement, but shows potential for growth."
-            else:
-                return f"Needs improvement in several areas. Technical skills ({detailed_analysis['technical_skills']}/10) require significant development. Focus on fundamentals recommended."
-                
-        except Exception as e:
-            logger.error(f"Error generating summary: {e}")
-            raise
-    
     async def analyze_multiple_media(self, media_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Analyze multiple media files"""
+        """Analyze multiple media files concurrently"""
+        self._validate_media_list(media_list)
         try:
-            results = []
-            for media in media_list:
-                try:
-                    analysis = await self.analyze_media(media["url"], media["type"])
-                    results.append({
-                        "media_id": media["id"],
-                        "analysis": analysis
-                    })
-                except Exception as e:
-                    logger.error(f"Error analyzing media {media.get('id', 'unknown')}: {e}")
-                    results.append({
-                        "media_id": media.get("id", "unknown"),
-                        "error": str(e)
-                    })
-            
-            return results
-            
+            return await self.analysis_service.analyze_multiple_media(media_list)
         except Exception as e:
             logger.error(f"Error analyzing multiple media: {e}")
             raise
     
-    async def get_recommendations(self, user_preferences: Dict[str, Any], available_media: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Get AI-powered recommendations based on user preferences"""
-        try:
-            # This is a simplified recommendation algorithm
-            # In production, you'd want to implement a more sophisticated recommendation system
-            
-            scored_media = []
-            
-            for media in available_media:
-                score = 0
-                
-                # Score based on AI rating
-                ai_analysis = media.get("ai_analysis", {})
-                rating = ai_analysis.get("rating")
-                
-                if rating == "exceptional":
-                    score += 100
-                elif rating == "excellent":
-                    score += 80
-                elif rating == "good":
-                    score += 60
-                elif rating == "developing":
-                    score += 40
-                else:
-                    score += 20
-                
-                # Score based on user preferences
-                if user_preferences.get("sport_category_id") == media.get("sport_category_id"):
-                    score += 30
-                
-                if user_preferences.get("location") and media.get("location") == user_preferences["location"]:
-                    score += 20
-                
-                # Add some randomness to avoid always showing the same results
-                score += random.uniform(-10, 10)
-                
-                scored_media.append({
-                    "media": media,
-                    "score": score
-                })
-            
-            # Sort by score and return top results
-            scored_media.sort(key=lambda x: x["score"], reverse=True)
-            
-            return [item["media"] for item in scored_media[:20]]
-            
-        except Exception as e:
-            logger.error(f"Error getting recommendations: {e}")
-            raise
-    
-    async def validate_media_content(self, media_url: str, media_type: str) -> Dict[str, Any]:
+    async def validate_media_content(self, media_url: str, media_type: str) -> ContentValidationResult:
         """Validate media content for appropriateness"""
+        self._validate_media_input(media_url, media_type)
         try:
-            # Simulate content validation
-            # In production, this would use content moderation APIs
-            
-            await asyncio.sleep(random.uniform(1, 3))
-            
-            # Simulate validation results
-            is_appropriate = random.choice([True, True, True, True, False])  # 80% appropriate
-            
-            validation_result = {
-                "is_appropriate": is_appropriate,
-                "confidence": round(random.uniform(0.8, 0.99), 3),
-                "flags": []
-            }
-            
-            if not is_appropriate:
-                validation_result["flags"] = ["inappropriate_content"]
-            
-            return validation_result
-            
+            return await self.moderation_service.validate_content(media_url, media_type)
         except Exception as e:
-            logger.error(f"Error validating media content: {e}")
+            logger.error(f"Error validating media content {media_url}: {e}")
             raise
     
-    async def extract_metadata(self, media_url: str, media_type: str) -> Dict[str, Any]:
+    async def extract_metadata(self, media_url: str, media_type: str) -> MetadataExtractionResult:
         """Extract metadata from media"""
+        self._validate_media_input(media_url, media_type)
         try:
-            # Simulate metadata extraction
-            # In production, this would use computer vision APIs
-            
-            await asyncio.sleep(random.uniform(1, 2))
-            
-            metadata = {
-                "duration": random.randint(10, 300) if media_type in ["video", "reel"] else None,
-                "resolution": f"{random.choice([720, 1080, 1440])}p",
-                "file_size": random.randint(1024, 10240),  # KB
-                "format": media_type,
-                "extracted_at": datetime.utcnow().isoformat()
-            }
-            
-            return metadata
-            
+            return await self.extraction_service.extract_metadata(media_url, media_type)
         except Exception as e:
-            logger.error(f"Error extracting metadata: {e}")
-            raise 
+            logger.error(f"Error extracting metadata from {media_url}: {e}")
+            raise
+    
+    async def detect_sport(self, media_url: str, media_type: str) -> str:
+        """Detect the sport being played in the media"""
+        self._validate_media_input(media_url, media_type)
+        try:
+            return await self.analysis_service.detect_sport(media_url, media_type)
+        except Exception as e:
+            logger.error(f"Error detecting sport for {media_url}: {e}")
+            raise
+    
+    async def get_analysis_summary(self, media_id: str, analysis_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a summary of analysis results"""
+        if not media_id or not isinstance(media_id, str):
+            raise ValueError("media_id must be a non-empty string")
+        if not isinstance(analysis_result, dict):
+            raise ValueError("analysis_result must be a dictionary")
+        try:
+            return await self.analysis_service.get_analysis_summary(media_id, analysis_result)
+        except Exception as e:
+            logger.error(f"Error generating analysis summary for {media_id}: {e}")
+            raise
+    
+    # Batch operations for multiple media
+    async def batch_validate_content(self, media_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Validate multiple media files for content appropriateness"""
+        self._validate_media_list(media_list)
+        try:
+            return await self.moderation_service.batch_validate_content(media_list)
+        except Exception as e:
+            logger.error(f"Error batch validating content: {e}")
+            raise
+    
+    async def batch_extract_metadata(self, media_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract metadata from multiple media files"""
+        self._validate_media_list(media_list)
+        try:
+            return await self.extraction_service.batch_extract_metadata(media_list)
+        except Exception as e:
+            logger.error(f"Error batch extracting metadata: {e}")
+            raise
+    
+    # Statistics and reporting
+    def get_moderation_stats(self, validation_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Get statistics from content moderation results"""
+        if not isinstance(validation_results, list):
+            raise ValueError("validation_results must be a list")
+        try:
+            return self.moderation_service.get_moderation_stats(validation_results)
+        except Exception as e:
+            logger.error(f"Error getting moderation stats: {e}")
+            raise
+    
+    def get_metadata_summary(self, metadata_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Get summary statistics from metadata extraction results"""
+        if not isinstance(metadata_results, list):
+            raise ValueError("metadata_results must be a list")
+        try:
+            return self.extraction_service.get_metadata_summary(metadata_results)
+        except Exception as e:
+            logger.error(f"Error getting metadata summary: {e}")
+            raise
+    
+    def get_service_status(self) -> ServiceStatusResult:
+        """Get current service status and configuration"""
+        try:
+            return {
+                "status": "operational",
+                "ai_provider": self.ai_provider.get_provider_info(),
+                "services": {
+                    "analysis": self.analysis_service.get_service_status(),
+                    "moderation": self.moderation_service.get_service_status(),
+                    "extraction": self.extraction_service.get_service_status()
+                },
+                "config": {
+                    "confidence_threshold": self.config.confidence_threshold,
+                    "max_processing_time": self.config.max_processing_time,
+                    "enable_concurrent_analysis": self.config.enable_concurrent_analysis,
+                    "max_concurrent_analyses": self.config.max_concurrent_analyses,
+                    "enable_content_moderation": self.config.enable_content_moderation,
+                    "moderation_threshold": self.config.moderation_threshold,
+                    "enable_metadata_extraction": self.config.enable_metadata_extraction,
+                    "extract_technical_details": self.config.extract_technical_details,
+                    "auto_detect_sport": self.config.auto_detect_sport,
+                    "supported_sports": self.config.supported_sports,
+                    "cache_results": self.config.cache_results,
+                    "cache_ttl_hours": self.config.cache_ttl_hours,
+                    "mock_mode": self.config.enable_mock_mode
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error getting service status: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+    
+    def is_healthy(self) -> bool:
+        """Check if the service is healthy and ready to process requests"""
+        try:
+            # Check if AI provider is available
+            provider_info = self.ai_provider.get_provider_info()
+            if not provider_info.get('available', False):
+                return False
+            
+            # Check if all services are operational
+            status = self.get_service_status()
+            return status['status'] == 'operational'
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False
+    
+    def get_health_summary(self) -> Dict[str, Any]:
+        """Get a concise health summary"""
+        try:
+            is_healthy = self.is_healthy()
+            return {
+                "healthy": is_healthy,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ai_provider_available": self.ai_provider.get_provider_info().get('available', False),
+                "services_operational": is_healthy
+            }
+        except Exception as e:
+            logger.error(f"Error getting health summary: {e}")
+            return {
+                "healthy": False,
+                "error": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            } 

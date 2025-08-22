@@ -19,7 +19,7 @@ test/
 │   ├── test_user_service.py       # UserService tests
 │   ├── test_athlete_service.py    # AthleteService tests
 │   ├── test_scout_service.py      # ScoutService tests
-│   ├── test_media_service.py      # MediaService tests
+│   ├── test_media_service.py              # MediaService tests (refactored)
 │   ├── test_opportunity_service.py # OpportunityService tests
 │   ├── test_conversation_service.py # ConversationService tests
 │   ├── test_notification_service.py # NotificationService tests

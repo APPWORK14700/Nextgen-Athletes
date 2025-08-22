@@ -1,262 +1,294 @@
-from typing import Optional, Dict, Any, List
+"""
+Refactored Media Service - Main orchestrator for media operations
+"""
 import logging
-from datetime import datetime, timezone, timedelta
-import asyncio
+from typing import Optional, List, Dict, Any
 
-from ..models.media import Media, MediaCreate, MediaUpdate, AIAnalysis
-from ..models.base import PaginatedResponse
-from .database_service import DatabaseService
-from .ai_service import AIService
-from firebase_admin.firestore import FieldFilter
-from app.api.exceptions import ValidationError, ResourceNotFoundError, DatabaseError, AuthorizationError
+from .media_upload_service import MediaUploadService
+from .media_query_service import MediaQueryService
+from ..aiAgents.media_analysis_agent import MediaAnalysisAgent
+from ..aiAgents.media_recommendation_agent import MediaRecommendationAgent
+from ..models.media import MediaCreate, MediaUpdate
+from ..models.media_responses import (
+    MediaResponse, MediaListResponse, MediaStatusResponse, 
+    BulkUploadResponse, RecommendationResponse
+)
+from ..config.media_config import get_media_config
+from ..api.exceptions import ValidationError, ResourceNotFoundError, DatabaseError, AuthorizationError
 
 logger = logging.getLogger(__name__)
 
 
 class MediaService:
-    """Media service for managing athlete media uploads and AI analysis"""
+    """
+    Main Media Service that orchestrates specialized services
+    
+    This service acts as a facade, delegating specific operations to specialized services:
+    - MediaUploadService: Handles upload operations
+    - MediaQueryService: Handles query and retrieval operations  
+    - MediaAnalysisAgent: Handles AI analysis operations
+    - MediaRecommendationAgent: Handles recommendation operations
+    """
     
     def __init__(self):
-        self.media_service = DatabaseService("media")
-        self.ai_service = AIService()
-        self.max_uploads_per_hour = 20  # Rate limiting
-        self.max_file_size_mb = 100  # Maximum file size in MB
-        self.supported_types = ["video", "image", "reel"]
-        self.supported_formats = {
-            "video": ["mp4", "mov", "avi"],
-            "image": ["jpg", "jpeg", "png", "gif"],
-            "reel": ["mp4", "mov"]
-        }
+        self.config = get_media_config()
+        self.upload_service = MediaUploadService()
+        self.query_service = MediaQueryService()
+        self.analysis_agent = MediaAnalysisAgent()
+        self.recommendation_agent = MediaRecommendationAgent()
+        
+        # Configuration constants
+        self.DEFAULT_MEDIA_LIMIT = self.config.get('default_media_limit', 100)
+        self.MAX_MEDIA_LIMIT = self.config.get('max_media_limit', 1000)
+        self.DEFAULT_RECOMMENDATION_LIMIT = self.config.get('default_recommendation_limit', 20)
+        self.MAX_RECOMMENDATION_LIMIT = self.config.get('max_recommendation_limit', 100)
     
-    async def upload_media(self, athlete_id: str, media_data: MediaCreate, file_url: str, thumbnail_url: Optional[str] = None) -> Dict[str, Any]:
-        """Upload media for athlete"""
-        try:
-            # Input validation
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
-            if not media_data.type:
-                raise ValidationError("Media type is required")
-            if not file_url or not file_url.strip():
-                raise ValidationError("File URL is required")
-            
-            # Validate media type
-            if media_data.type not in self.supported_types:
-                raise ValidationError(f"Invalid media type. Must be one of: {self.supported_types}")
-            
-            # Validate file URL format
-            if not self._is_valid_url(file_url):
-                raise ValidationError("Invalid file URL format")
-            
-            if thumbnail_url and not self._is_valid_url(thumbnail_url):
-                raise ValidationError("Invalid thumbnail URL format")
-            
-            # Check rate limiting
-            await self._check_upload_rate_limit(athlete_id)
-            
-            # Create media document
-            media_doc = {
-                "athlete_id": athlete_id,
-                "type": media_data.type,
-                "url": file_url.strip(),
-                "thumbnail_url": thumbnail_url.strip() if thumbnail_url else None,
-                "description": media_data.description.strip() if media_data.description else None,
-                "moderation_status": "pending",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "ai_analysis": {
-                    "status": "pending",
-                    "rating": None,
-                    "summary": None,
-                    "detailed_analysis": None,
-                    "sport_specific_metrics": None,
-                    "confidence_score": None,
-                    "analysis_started_at": None,
-                    "analysis_completed_at": None,
-                    "retry_count": 0,
-                    "max_retries": 5,
-                    "next_retry_at": None,
-                    "error_message": None
-                }
-            }
-            
-            media_id = await self.media_service.create(media_doc)
-            
-            # Trigger AI analysis asynchronously
-            asyncio.create_task(self._analyze_media(media_id))
-            
-            return await self.get_media_by_id(media_id)
-            
-        except ValidationError:
-            raise
-        except Exception as e:
-            logger.error(f"Error uploading media for athlete {athlete_id}: {e}")
-            raise DatabaseError(f"Failed to upload media: {str(e)}")
+    # Upload Operations (delegated to MediaUploadService)
     
-    async def get_media_by_id(self, media_id: str) -> Optional[Dict[str, Any]]:
-        """Get media by ID"""
-        try:
-            if not media_id:
-                raise ValidationError("Media ID is required")
+    async def upload_media(self, athlete_id: str, media_data: MediaCreate, file_url: str, thumbnail_url: Optional[str] = None) -> MediaResponse:
+        """
+        Upload media for athlete
+        
+        Args:
+            athlete_id: ID of the athlete uploading the media
+            media_data: Media creation data
+            file_url: URL to the media file
+            thumbnail_url: Optional URL to the thumbnail
             
-            media_doc = await self.media_service.get_by_id(media_id)
-            if not media_doc:
-                raise ResourceNotFoundError("Media not found", media_id)
+        Returns:
+            MediaResponse: Created media response
             
-            return media_doc
-            
-        except (ValidationError, ResourceNotFoundError):
-            raise
-        except Exception as e:
-            logger.error(f"Error getting media by ID {media_id}: {e}")
-            raise DatabaseError(f"Failed to get media: {str(e)}")
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If upload operation fails
+        """
+        return await self.upload_service.upload_media(athlete_id, media_data, file_url, thumbnail_url)
     
-    async def get_athlete_media(self, athlete_id: str, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """Get all media for an athlete"""
-        try:
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
+    async def bulk_upload_media(self, athlete_id: str, media_list: List[Dict[str, Any]]) -> BulkUploadResponse:
+        """
+        Bulk upload multiple media files
+        
+        Args:
+            athlete_id: ID of the athlete uploading the media
+            media_list: List of media data dictionaries
             
-            if limit < 1 or limit > 1000:
-                raise ValidationError("Limit must be between 1 and 1000")
-            if offset < 0:
-                raise ValidationError("Offset must be non-negative")
+        Returns:
+            BulkUploadResponse: Result of bulk upload operation
             
-            filters = [FieldFilter("athlete_id", "==", athlete_id)]
-            media = await self.media_service.query(filters, limit, offset)
-            return media
-            
-        except ValidationError:
-            raise
-        except Exception as e:
-            logger.error(f"Error getting athlete media for {athlete_id}: {e}")
-            raise DatabaseError(f"Failed to get athlete media: {str(e)}")
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If bulk upload operation fails
+        """
+        return await self.upload_service.bulk_upload_media(athlete_id, media_list)
     
-    async def update_media(self, media_id: str, media_data: MediaUpdate, athlete_id: str) -> Dict[str, Any]:
-        """Update media metadata"""
-        try:
-            if not media_id:
-                raise ValidationError("Media ID is required")
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
+    async def update_media(self, media_id: str, media_data: MediaUpdate, athlete_id: str) -> MediaResponse:
+        """
+        Update media metadata
+        
+        Args:
+            media_id: ID of the media to update
+            media_data: Updated media data
+            athlete_id: ID of the athlete (for authorization)
             
-            # Check ownership
-            media_doc = await self.get_media_by_id(media_id)
-            if media_doc["athlete_id"] != athlete_id:
-                raise AuthorizationError("Not authorized to update this media")
+        Returns:
+            MediaResponse: Updated media response
             
-            update_data = {}
-            
-            if media_data.description is not None:
-                update_data["description"] = media_data.description.strip() if media_data.description else None
-            
-            if update_data:
-                await self.media_service.update(media_id, update_data)
-            
-            return await self.get_media_by_id(media_id)
-            
-        except (ValidationError, ResourceNotFoundError, AuthorizationError):
-            raise
-        except Exception as e:
-            logger.error(f"Error updating media {media_id}: {e}")
-            raise DatabaseError(f"Failed to update media: {str(e)}")
+        Raises:
+            ValidationError: If input validation fails
+            ResourceNotFoundError: If media not found
+            AuthorizationError: If athlete not authorized
+            DatabaseError: If update operation fails
+        """
+        return await self.upload_service.update_media(media_id, media_data, athlete_id)
     
     async def delete_media(self, media_id: str, athlete_id: str) -> bool:
-        """Delete media"""
-        try:
-            if not media_id:
-                raise ValidationError("Media ID is required")
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
+        """
+        Delete media
+        
+        Args:
+            media_id: ID of the media to delete
+            athlete_id: ID of the athlete (for authorization)
             
-            # Check ownership
-            media_doc = await self.get_media_by_id(media_id)
-            if media_doc["athlete_id"] != athlete_id:
-                raise AuthorizationError("Not authorized to delete this media")
+        Returns:
+            bool: True if deletion successful
             
-            await self.media_service.delete(media_id)
-            return True
-            
-        except (ValidationError, ResourceNotFoundError, AuthorizationError):
-            raise
-        except Exception as e:
-            logger.error(f"Error deleting media {media_id}: {e}")
-            raise DatabaseError(f"Failed to delete media: {str(e)}")
+        Raises:
+            ValidationError: If input validation fails
+            ResourceNotFoundError: If media not found
+            AuthorizationError: If athlete not authorized
+            DatabaseError: If deletion operation fails
+        """
+        return await self.upload_service.delete_media(media_id, athlete_id)
     
-    async def get_media_status(self, media_id: str, athlete_id: str) -> Optional[Dict[str, Any]]:
-        """Get AI analysis status for media"""
-        try:
-            if not media_id:
-                raise ValidationError("Media ID is required")
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
+    async def bulk_delete_media(self, media_ids: List[str], athlete_id: str) -> bool:
+        """
+        Bulk delete media files
+        
+        Args:
+            media_ids: List of media IDs to delete
+            athlete_id: ID of the athlete (for authorization)
             
-            media_doc = await self.get_media_by_id(media_id)
-            if not media_doc:
-                raise ResourceNotFoundError("Media not found", media_id)
+        Returns:
+            bool: True if bulk deletion successful
             
-            # Check ownership
-            if media_doc["athlete_id"] != athlete_id:
-                raise AuthorizationError("Not authorized to access this media")
+        Raises:
+            ValidationError: If input validation fails
+            AuthorizationError: If athlete not authorized
+            DatabaseError: If bulk deletion operation fails
+        """
+        return await self.upload_service.bulk_delete_media(media_ids, athlete_id)
+    
+    # Query Operations (delegated to MediaQueryService)
+    
+    async def get_media_by_id(self, media_id: str) -> Optional[MediaResponse]:
+        """
+        Get media by ID
+        
+        Args:
+            media_id: ID of the media to retrieve
             
-            return {
-                "media_id": media_id,
-                "ai_analysis": media_doc.get("ai_analysis", {})
-            }
+        Returns:
+            MediaResponse: Media response if found, None otherwise
             
-        except (ValidationError, ResourceNotFoundError, AuthorizationError):
-            raise
-        except Exception as e:
-            logger.error(f"Error getting media status for {media_id}: {e}")
-            raise DatabaseError(f"Failed to get media status: {str(e)}")
+        Raises:
+            ValidationError: If media_id is invalid
+            ResourceNotFoundError: If media not found
+            DatabaseError: If retrieval operation fails
+        """
+        return await self.query_service.get_media_by_id(media_id)
+    
+    async def get_athlete_media(self, athlete_id: str, limit: int = None, offset: int = 0) -> MediaListResponse:
+        """
+        Get all media for an athlete
+        
+        Args:
+            athlete_id: ID of the athlete
+            limit: Maximum number of media items to return (defaults to config value)
+            offset: Number of items to skip for pagination
+            
+        Returns:
+            MediaListResponse: Paginated list of media items
+            
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If retrieval operation fails
+        """
+        if limit is None:
+            limit = self.DEFAULT_MEDIA_LIMIT
+            
+        if limit < 1 or limit > self.MAX_MEDIA_LIMIT:
+            raise ValidationError(f"Limit must be between 1 and {self.MAX_MEDIA_LIMIT}")
+        if offset < 0:
+            raise ValidationError("Offset must be non-negative")
+            
+        return await self.query_service.get_athlete_media(athlete_id, limit, offset)
+    
+    async def get_media_status(self, media_id: str, athlete_id: str) -> Optional[MediaStatusResponse]:
+        """
+        Get AI analysis status for media
+        
+        Args:
+            media_id: ID of the media
+            athlete_id: ID of the athlete (for authorization)
+            
+        Returns:
+            MediaStatusResponse: Media status if found and authorized, None otherwise
+            
+        Raises:
+            ValidationError: If input validation fails
+            ResourceNotFoundError: If media not found
+            AuthorizationError: If athlete not authorized
+            DatabaseError: If retrieval operation fails
+        """
+        return await self.query_service.get_media_status(media_id, athlete_id)
+    
+    async def search_media(self, query: str, media_type: Optional[str] = None, 
+                          sport_category: Optional[str] = None, limit: int = 50, 
+                          offset: int = 0) -> MediaListResponse:
+        """
+        Search media by various criteria
+        
+        Args:
+            query: Search query string
+            media_type: Optional media type filter
+            sport_category: Optional sport category filter
+            limit: Maximum number of results to return
+            offset: Number of items to skip for pagination
+            
+        Returns:
+            MediaListResponse: Paginated search results
+            
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If search operation fails
+        """
+        if not query or not query.strip():
+            raise ValidationError("Search query is required")
+        if limit < 1 or limit > self.MAX_MEDIA_LIMIT:
+            raise ValidationError(f"Limit must be between 1 and {self.MAX_MEDIA_LIMIT}")
+        if offset < 0:
+            raise ValidationError("Offset must be non-negative")
+            
+        return await self.query_service.search_media(query, media_type, sport_category, limit, offset)
+    
+    async def get_media_by_type(self, media_type: str, limit: int = 50, 
+                               offset: int = 0, moderation_status: str = "approved") -> MediaListResponse:
+        """
+        Get media by type with optional moderation status filter
+        
+        Args:
+            media_type: Type of media to retrieve
+            limit: Maximum number of results to return
+            offset: Number of items to skip for pagination
+            moderation_status: Moderation status filter
+            
+        Returns:
+            MediaListResponse: Paginated list of media items
+            
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If retrieval operation fails
+        """
+        if not media_type:
+            raise ValidationError("Media type is required")
+        if limit < 1 or limit > self.MAX_MEDIA_LIMIT:
+            raise ValidationError(f"Limit must be between 1 and {self.MAX_MEDIA_LIMIT}")
+        if offset < 0:
+            raise ValidationError("Offset must be non-negative")
+            
+        return await self.query_service.get_media_by_type(media_type, limit, offset, moderation_status)
+    
+    # AI Analysis Operations (delegated to MediaAnalysisAgent)
     
     async def retry_ai_analysis(self, media_id: str, athlete_id: str) -> bool:
-        """Retry AI analysis for failed media"""
+        """
+        Retry AI analysis for failed media
+        
+        Args:
+            media_id: ID of the media to retry analysis for
+            athlete_id: ID of the athlete (for authorization)
+            
+        Returns:
+            bool: True if retry initiated successfully
+            
+        Raises:
+            ValidationError: If input validation fails
+            ResourceNotFoundError: If media not found
+            AuthorizationError: If athlete not authorized
+            DatabaseError: If retry operation fails
+        """
+        if not media_id:
+            raise ValidationError("Media ID is required")
+        if not athlete_id:
+            raise ValidationError("Athlete ID is required")
+            
         try:
-            if not media_id:
-                raise ValidationError("Media ID is required")
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
-            
-            media_doc = await self.get_media_by_id(media_id)
-            if not media_doc:
-                raise ResourceNotFoundError("Media not found", media_id)
-            
-            # Check ownership
-            if media_doc["athlete_id"] != athlete_id:
+            # Check ownership first
+            media_doc = await self.query_service.get_media_by_id(media_id)
+            if media_doc.athlete_id != athlete_id:
                 raise AuthorizationError("Not authorized to retry analysis for this media")
             
-            ai_analysis = media_doc.get("ai_analysis", {})
-            
-            # Check if we can retry
-            retry_count = ai_analysis.get("retry_count", 0)
-            max_retries = ai_analysis.get("max_retries", 5)
-            
-            if retry_count >= max_retries:
-                raise ValidationError("Maximum retry attempts reached")
-            
-            # Reset AI analysis status
-            update_data = {
-                "ai_analysis": {
-                    "status": "pending",
-                    "rating": None,
-                    "summary": None,
-                    "detailed_analysis": None,
-                    "sport_specific_metrics": None,
-                    "confidence_score": None,
-                    "analysis_started_at": None,
-                    "analysis_completed_at": None,
-                    "retry_count": retry_count + 1,
-                    "max_retries": max_retries,
-                    "next_retry_at": None,
-                    "error_message": None
-                }
-            }
-            
-            await self.media_service.update(media_id, update_data)
-            
-            # Trigger AI analysis asynchronously
-            asyncio.create_task(self._analyze_media(media_id))
-            
-            return True
+            return await self.analysis_agent.retry_analysis(media_id)
             
         except (ValidationError, ResourceNotFoundError, AuthorizationError):
             raise
@@ -264,256 +296,197 @@ class MediaService:
             logger.error(f"Error retrying AI analysis for media {media_id}: {e}")
             raise DatabaseError(f"Failed to retry AI analysis: {str(e)}")
     
-    async def get_recommended_reels(self, scout_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get recommended reels for scout"""
+    async def get_ai_analysis_status(self, media_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get AI analysis status for media (internal use)
+        
+        Args:
+            media_id: ID of the media
+            
+        Returns:
+            Dict[str, Any]: AI analysis status if found, None otherwise
+            
+        Raises:
+            ValidationError: If media_id is invalid
+            DatabaseError: If retrieval operation fails
+        """
+        if not media_id:
+            raise ValidationError("Media ID is required")
+            
         try:
-            if not scout_id:
-                raise ValidationError("Scout ID is required")
+            media_doc = await self.query_service.get_media_by_id(media_id)
+            return media_doc.ai_analysis if media_doc else None
+        except Exception as e:
+            logger.error(f"Error getting AI analysis status for media {media_id}: {e}")
+            raise DatabaseError(f"Failed to get AI analysis status: {str(e)}")
+    
+    # Recommendation Operations (delegated to MediaRecommendationAgent)
+    
+    async def get_recommended_reels(self, scout_id: str, limit: int = None) -> List[MediaResponse]:
+        """
+        Get recommended reels for scout
+        
+        Args:
+            scout_id: ID of the scout
+            limit: Maximum number of recommendations to return (defaults to config value)
             
-            if limit < 1 or limit > 100:
-                raise ValidationError("Limit must be between 1 and 100")
+        Returns:
+            List[MediaResponse]: List of recommended reels
             
-            # This is a simplified recommendation algorithm
-            # In production, you'd want to implement a more sophisticated recommendation system
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If recommendation operation fails
+        """
+        if not scout_id:
+            raise ValidationError("Scout ID is required")
+        if limit is None:
+            limit = self.DEFAULT_RECOMMENDATION_LIMIT
+        if limit < 1 or limit > self.MAX_RECOMMENDATION_LIMIT:
+            raise ValidationError(f"Limit must be between 1 and {self.MAX_RECOMMENDATION_LIMIT}")
             
-            # Get all reels with approved moderation status
-            filters = [
-                FieldFilter("type", "==", "reel"),
-                FieldFilter("moderation_status", "==", "approved")
-            ]
+        try:
+            reels_data = await self.recommendation_agent.get_recommended_reels(scout_id, limit)
+            return self._convert_media_data_to_responses(reels_data)
             
-            reels = await self.media_service.query(filters, limit * 2)  # Get more to filter
-            
-            # For now, just return reels with completed AI analysis
-            # In production, you'd want to consider:
-            # - Scout's focus areas
-            # - Athlete ratings
-            # - Location preferences
-            # - Sport category preferences
-            
-            recommended_reels = []
-            for reel in reels:
-                ai_analysis = reel.get("ai_analysis", {})
-                if ai_analysis.get("status") == "completed":
-                    recommended_reels.append(reel)
-                    if len(recommended_reels) >= limit:
-                        break
-            
-            return recommended_reels
-            
-        except ValidationError:
-            raise
         except Exception as e:
             logger.error(f"Error getting recommended reels for scout {scout_id}: {e}")
             raise DatabaseError(f"Failed to get recommended reels: {str(e)}")
     
-    async def bulk_upload_media(self, athlete_id: str, media_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Bulk upload multiple media files"""
-        try:
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
-            if not media_list:
-                raise ValidationError("Media list is required")
-            
-            if len(media_list) > 10:
-                raise ValidationError("Maximum 10 files per bulk upload")
-            
-            # Check rate limiting
-            await self._check_upload_rate_limit(athlete_id)
-            
-            uploaded_count = 0
-            failed_count = 0
-            media_ids = []
-            errors = []
-            
-            # Process uploads concurrently for better performance
-            upload_tasks = []
-            for media_item in media_list:
-                task = self._process_single_upload(athlete_id, media_item)
-                upload_tasks.append(task)
-            
-            # Wait for all uploads to complete
-            results = await asyncio.gather(*upload_tasks, return_exceptions=True)
-            
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    failed_count += 1
-                    errors.append(f"Failed to upload media {i+1}: {str(result)}")
-                else:
-                    uploaded_count += 1
-                    media_ids.append(result["id"])
-            
-            return {
-                "uploaded_count": uploaded_count,
-                "failed_count": failed_count,
-                "media_ids": media_ids,
-                "errors": errors
-            }
-            
-        except ValidationError:
-            raise
-        except Exception as e:
-            logger.error(f"Error bulk uploading media for athlete {athlete_id}: {e}")
-            raise DatabaseError(f"Failed to bulk upload media: {str(e)}")
-    
-    async def bulk_delete_media(self, media_ids: List[str], athlete_id: str) -> bool:
-        """Bulk delete media files"""
-        try:
-            if not media_ids:
-                raise ValidationError("Media IDs are required")
-            if not athlete_id:
-                raise ValidationError("Athlete ID is required")
-            
-            if len(media_ids) > 50:
-                raise ValidationError("Maximum 50 files per bulk delete")
-            
-            # Validate ownership for all media
-            valid_media_ids = []
-            for media_id in media_ids:
-                try:
-                    media_doc = await self.get_media_by_id(media_id)
-                    if media_doc["athlete_id"] == athlete_id:
-                        valid_media_ids.append(media_id)
-                    else:
-                        logger.warning(f"Media {media_id} not owned by athlete {athlete_id}")
-                except ResourceNotFoundError:
-                    logger.warning(f"Media {media_id} not found")
-                    continue
-            
-            if valid_media_ids:
-                await self.media_service.batch_delete(valid_media_ids)
-            
-            return True
-            
-        except ValidationError:
-            raise
-        except Exception as e:
-            logger.error(f"Error bulk deleting media: {e}")
-            raise DatabaseError(f"Failed to bulk delete media: {str(e)}")
-    
-    async def _analyze_media(self, media_id: str) -> None:
-        """Analyze media with AI (background task)"""
-        try:
-            # Update status to processing
-            await self.media_service.update(media_id, {
-                "ai_analysis.analysis_started_at": datetime.now(timezone.utc).isoformat(),
-                "ai_analysis.status": "processing"
-            })
-            
-            # Get media data
-            media_doc = await self.media_service.get_by_id(media_id)
-            if not media_doc:
-                logger.error(f"Media {media_id} not found for analysis")
-                return
-            
-            # Perform AI analysis
-            analysis_result = await self.ai_service.analyze_media(
-                media_doc["url"],
-                media_doc["type"]
-            )
-            
-            # Update with analysis results
-            update_data = {
-                "ai_analysis.status": "completed",
-                "ai_analysis.rating": analysis_result.get("rating"),
-                "ai_analysis.summary": analysis_result.get("summary"),
-                "ai_analysis.detailed_analysis": analysis_result.get("detailed_analysis"),
-                "ai_analysis.sport_specific_metrics": analysis_result.get("sport_specific_metrics"),
-                "ai_analysis.confidence_score": analysis_result.get("confidence_score"),
-                "ai_analysis.analysis_completed_at": datetime.now(timezone.utc).isoformat()
-            }
-            
-            await self.media_service.update(media_id, update_data)
-            
-        except Exception as e:
-            logger.error(f"Error analyzing media {media_id}: {e}")
-            
-            # Update with error status
-            try:
-                media_doc = await self.media_service.get_by_id(media_id)
-                if media_doc:
-                    ai_analysis = media_doc.get("ai_analysis", {})
-                    retry_count = ai_analysis.get("retry_count", 0)
-                    max_retries = ai_analysis.get("max_retries", 5)
-                    
-                    if retry_count < max_retries:
-                        # Schedule retry with exponential backoff
-                        next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=2 ** retry_count)
-                        update_data = {
-                            "ai_analysis.status": "retrying",
-                            "ai_analysis.retry_count": retry_count + 1,
-                            "ai_analysis.next_retry_at": next_retry_at.isoformat(),
-                            "ai_analysis.error_message": str(e)
-                        }
-                    else:
-                        # Mark as failed
-                        update_data = {
-                            "ai_analysis.status": "failed",
-                            "ai_analysis.error_message": str(e)
-                        }
-                    
-                    await self.media_service.update(media_id, update_data)
-                    
-                    # Schedule retry if needed
-                    if retry_count < max_retries:
-                        asyncio.create_task(self._schedule_retry(media_id, next_retry_at))
-                        
-            except Exception as retry_error:
-                logger.error(f"Error updating media {media_id} with error status: {retry_error}")
-    
-    async def _schedule_retry(self, media_id: str, retry_at: datetime) -> None:
-        """Schedule retry for failed AI analysis"""
-        try:
-            # Wait until retry time
-            wait_seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
-            if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
-            
-            # Retry analysis
-            await self._analyze_media(media_id)
-            
-        except Exception as e:
-            logger.error(f"Error in scheduled retry for media {media_id}: {e}")
-    
-    async def _process_single_upload(self, athlete_id: str, media_item: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a single media upload (helper for bulk upload)"""
-        try:
-            media_data = MediaCreate(**media_item["metadata"])
-            file_url = media_item["file_url"]
-            thumbnail_url = media_item.get("thumbnail_url")
-            
-            return await self.upload_media(athlete_id, media_data, file_url, thumbnail_url)
-            
-        except Exception as e:
-            logger.error(f"Error processing single upload: {e}")
-            raise
-    
-    async def _check_upload_rate_limit(self, athlete_id: str) -> None:
-        """Check rate limiting for media uploads"""
-        try:
-            # Get uploads in the last hour
-            one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-            filters = [
-                FieldFilter("athlete_id", "==", athlete_id),
-                FieldFilter("created_at", ">=", one_hour_ago.isoformat())
-            ]
-            
-            recent_count = await self.media_service.count(filters)
-            if recent_count >= self.max_uploads_per_hour:
-                raise ValidationError(f"Rate limit exceeded. Maximum {self.max_uploads_per_hour} uploads per hour.")
-                
-        except ValidationError:
-            raise
-        except Exception as e:
-            logger.error(f"Error checking upload rate limit for athlete {athlete_id}: {e}")
-            # Don't fail the main operation due to rate limit check failure
-            pass
-    
-    def _is_valid_url(self, url: str) -> bool:
-        """Validate URL format"""
-        if not url or not url.strip():
-            return False
+    async def get_recommended_media_by_sport(self, sport_category: str, limit: int = None) -> List[MediaResponse]:
+        """
+        Get recommended media by sport category
         
-        # Basic URL validation
-        url = url.strip()
-        return url.startswith(('http://', 'https://', 'gs://')) and len(url) > 10 
+        Args:
+            sport_category: Sport category for recommendations
+            limit: Maximum number of recommendations to return (defaults to config value)
+            
+        Returns:
+            List[MediaResponse]: List of recommended media items
+            
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If recommendation operation fails
+        """
+        if not sport_category:
+            raise ValidationError("Sport category is required")
+        if limit is None:
+            limit = self.DEFAULT_RECOMMENDATION_LIMIT
+        if limit < 1 or limit > self.MAX_RECOMMENDATION_LIMIT:
+            raise ValidationError(f"Limit must be between 1 and {self.MAX_RECOMMENDATION_LIMIT}")
+            
+        try:
+            media_data = await self.recommendation_agent.get_recommended_media_by_sport(sport_category, limit)
+            return self._convert_media_data_to_responses(media_data)
+            
+        except Exception as e:
+            logger.error(f"Error getting recommended media by sport {sport_category}: {e}")
+            raise DatabaseError(f"Failed to get recommended media: {str(e)}")
+    
+    async def get_trending_media(self, limit: int = None, time_window_hours: int = 24) -> List[MediaResponse]:
+        """
+        Get trending media based on recent activity
+        
+        Args:
+            limit: Maximum number of recommendations to return (defaults to config value)
+            time_window_hours: Time window for trending calculation in hours
+            
+        Returns:
+            List[MediaResponse]: List of trending media items
+            
+        Raises:
+            ValidationError: If input validation fails
+            DatabaseError: If recommendation operation fails
+        """
+        if limit is None:
+            limit = self.DEFAULT_RECOMMENDATION_LIMIT
+        if limit < 1 or limit > self.MAX_RECOMMENDATION_LIMIT:
+            raise ValidationError(f"Limit must be between 1 and {self.MAX_RECOMMENDATION_LIMIT}")
+        if time_window_hours < 1 or time_window_hours > 168:  # Max 1 week
+            raise ValidationError("Time window must be between 1 and 168 hours")
+            
+        try:
+            media_data = await self.recommendation_agent.get_trending_media(limit, time_window_hours)
+            return self._convert_media_data_to_responses(media_data)
+            
+        except Exception as e:
+            logger.error(f"Error getting trending media: {e}")
+            raise DatabaseError(f"Failed to get trending media: {str(e)}")
+    
+    # Helper Methods
+    
+    def _convert_media_data_to_responses(self, media_data_list: List[Dict[str, Any]]) -> List[MediaResponse]:
+        """
+        Convert raw media data to MediaResponse objects
+        
+        Args:
+            media_data_list: List of raw media data dictionaries
+            
+        Returns:
+            List[MediaResponse]: List of converted MediaResponse objects
+        """
+        responses = []
+        for media_data in media_data_list:
+            try:
+                response = MediaResponse(
+                    id=media_data["id"],
+                    athlete_id=media_data["athlete_id"],
+                    type=media_data["type"],
+                    url=media_data["url"],
+                    thumbnail_url=media_data.get("thumbnail_url"),
+                    description=media_data.get("description"),
+                    moderation_status=media_data["moderation_status"],
+                    created_at=media_data["created_at"],
+                    ai_analysis=media_data.get("ai_analysis", {})
+                )
+                responses.append(response)
+            except Exception as e:
+                logger.warning(f"Error converting media data: {e}")
+                continue
+        return responses
+    
+    # Utility Operations
+    
+    async def get_upload_rate_limit_info(self, athlete_id: str) -> Dict[str, Any]:
+        """
+        Get upload rate limit information for athlete
+        
+        Args:
+            athlete_id: ID of the athlete
+            
+        Returns:
+            Dict[str, Any]: Rate limit information
+            
+        Raises:
+            ValidationError: If athlete_id is invalid
+        """
+        if not athlete_id:
+            raise ValidationError("Athlete ID is required")
+            
+        return await self.upload_service.get_upload_rate_limit_info(athlete_id)
+    
+    async def cleanup_background_tasks(self) -> None:
+        """Clean up background tasks from AI analysis"""
+        await self.analysis_agent.cleanup_background_tasks()
+    
+    def get_background_task_count(self) -> int:
+        """Get count of active background tasks"""
+        return self.analysis_agent.get_background_task_count()
+    
+    def get_service_status(self) -> Dict[str, Any]:
+        """Get status of all media services"""
+        return {
+            "upload_service": "active",
+            "query_service": "active", 
+            "analysis_agent": "active",
+            "recommendation_agent": "active",
+            "background_tasks": self.get_background_task_count(),
+            "config": {
+                "max_uploads_per_hour": self.config['max_uploads_per_hour'],
+                "supported_types": self.config['supported_types'],
+                "ai_analysis_max_retries": self.config['ai_analysis_max_retries'],
+                "default_media_limit": self.DEFAULT_MEDIA_LIMIT,
+                "max_media_limit": self.MAX_MEDIA_LIMIT,
+                "default_recommendation_limit": self.DEFAULT_RECOMMENDATION_LIMIT,
+                "max_recommendation_limit": self.MAX_RECOMMENDATION_LIMIT
+            }
+        } 

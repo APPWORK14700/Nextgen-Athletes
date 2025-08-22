@@ -387,11 +387,11 @@ async def upload_scout_media(
             tags=tags.split(",") if tags else []
         )
         
-        result = await media_service.upload_media(
+        result = await media_service.upload_media_compat(
             user_id=current_user["uid"],
             user_type="scout",
             file=file,
-            media_data=media_data
+            metadata=media_data
         )
         logger.info(f"Media uploaded by scout {current_user['uid']}")
         return result
@@ -410,13 +410,19 @@ async def get_scout_media(
 ):
     """Get media uploaded by current scout"""
     try:
-        media_list = await media_service.get_user_media(
-            user_id=current_user["uid"],
-            user_type="scout",
-            page=page,
-            limit=limit
+        # Use the new media service structure
+        # For scouts, we'll get media by type and filter by ownership
+        # Since scouts don't have a dedicated method, we'll use the general media service
+        result = await media_service.get_media_by_type(
+            media_type="all",  # Get all types
+            limit=limit,
+            offset=(page - 1) * limit,
+            moderation_status="all"
         )
-        return media_list
+        
+        # Filter to only show the scout's own media
+        scout_media = [media for media in result.media if media.athlete_id == current_user["uid"]]
+        return scout_media
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -431,11 +437,7 @@ async def delete_scout_media(
 ):
     """Delete media uploaded by current scout"""
     try:
-        await media_service.delete_user_media(
-            media_id=media_id,
-            user_id=current_user["uid"],
-            user_type="scout"
-        )
+        await media_service.delete_media(media_id, current_user["uid"])
         logger.info(f"Media {media_id} deleted by scout {current_user['uid']}")
         return {"message": "Media deleted successfully"}
     except (ResourceNotFoundError, AuthorizationError) as e:

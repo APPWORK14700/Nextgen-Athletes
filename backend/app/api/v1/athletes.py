@@ -124,15 +124,26 @@ async def get_my_media(
                 raise ValidationError("Invalid media type. Must be 'video', 'image', or 'reel'")
             filters["type"] = type
         
-        media_list = await media_service.get_user_media(
-            user_id=current_user["uid"],
-            user_type="athlete",
-            page=(offset // limit) + 1,
-            limit=limit,
-            filters=filters
-        )
-        
-        return [MediaResponse(**media) for media in media_list]
+        # Use the new media service structure
+        if type:
+            # Filter by type using the new service
+            result = await media_service.get_media_by_type(
+                media_type=type,
+                limit=limit,
+                offset=offset,
+                moderation_status="all"  # Show all media for the athlete
+            )
+            # Filter to only show current athlete's media
+            filtered_media = [media for media in result.media if media.athlete_id == current_user["uid"]]
+            return filtered_media
+        else:
+            # Get all media for the athlete
+            result = await media_service.get_athlete_media(
+                athlete_id=current_user["uid"],
+                limit=limit,
+                offset=offset
+            )
+            return result.media
         
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -164,15 +175,28 @@ async def get_athlete_media(
                 raise ValidationError("Invalid media type. Must be 'video', 'image', or 'reel'")
             filters["type"] = type
         
-        media_list = await media_service.get_user_media(
-            user_id=athlete_id,
-            user_type="athlete",
-            page=(offset // limit) + 1,
-            limit=limit,
-            filters=filters
-        )
-        
-        return [MediaResponse(**media) for media in media_list]
+        # Use the new media service structure
+        if type:
+            # Filter by type using the new service
+            result = await media_service.get_media_by_type(
+                media_type=type,
+                limit=limit,
+                offset=offset,
+                moderation_status="approved"  # Only show approved media to scouts
+            )
+            # Filter to only show the specific athlete's media
+            filtered_media = [media for media in result.media if media.athlete_id == athlete_id]
+            return filtered_media
+        else:
+            # Get all approved media for the athlete
+            result = await media_service.get_athlete_media(
+                athlete_id=athlete_id,
+                limit=limit,
+                offset=offset
+            )
+            # Filter to only show approved media
+            approved_media = [media for media in result.media if media.moderation_status == "approved"]
+            return approved_media
         
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))

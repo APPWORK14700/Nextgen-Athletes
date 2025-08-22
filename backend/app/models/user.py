@@ -70,11 +70,43 @@ class EmailVerification(BaseModel):
 
 
 class AuthResponse(BaseModel):
-    """Authentication response model"""
-    access_token: str
-    token_type: str = "bearer"
+    """Authentication response model - supports both token and message responses"""
+    message: Optional[str] = None
+    access_token: Optional[str] = None
+    token_type: Optional[str] = "bearer"
     user_id: Optional[str] = None
     email: Optional[str] = None
+    
+    @classmethod
+    def token_response(cls, access_token: str, user_id: str, email: str, token_type: str = "bearer"):
+        """Create a token-based response"""
+        return cls(
+            access_token=access_token,
+            token_type=token_type,
+            user_id=user_id,
+            email=email
+        )
+    
+    @classmethod
+    def message_response(cls, message: str, user_id: str = None, email: str = None):
+        """Create a message-based response"""
+        return cls(
+            message=message,
+            user_id=user_id,
+            email=email
+        )
+
+
+class SessionResponse(BaseModel):
+    """Session verification response model"""
+    uid: str
+    email: str
+    email_verified: bool
+    role: str
+    status: str
+    auth_time: Optional[int] = None
+    issued_at: Optional[int] = None
+    expires_at: Optional[int] = None
 
 
 class RefreshTokenRequest(BaseModel):
